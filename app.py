@@ -738,10 +738,29 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         except Exception:
             send_message(user_id, "Invalid user id.")
             return jsonify({"ok": True})
+        # Cancel any active/queued/paused tasks for the target user so they stop permanently and cannot be resumed.
+        stopped_count = cancel_active_task_for_user(target_id)
+        # Ensure finished_at is set for cancelled tasks (best-effort)
+        try:
+            db_execute("UPDATE tasks SET finished_at = ? WHERE user_id = ? AND status = 'cancelled' AND (finished_at IS NULL OR finished_at = '')", (get_now_iso(), target_id))
+        except Exception:
+            logger.exception("Error updating finished_at for cancelled tasks of user %s", target_id)
+
         # Remove target user regardless of their is_admin flag (admins or normal users)
         db_execute("DELETE FROM allowed_users WHERE user_id = ?", (target_id,))
         send_message(user_id, f"✅ User {target_id} removed.")
-        send_message(target_id, "❌ You have been removed. Contact the owner to regain access.")
+
+        # Notify the removed user: they were removed and any active/queued tasks were permanently stopped and cannot be resumed.
+        try:
+            send_message(target_id, "❌ You have been removed. Contact the owner to regain access.")
+            if stopped_count > 0:
+                send_message(target_id, f"🛑 Your active/queued task(s) ({stopped_count}) were stopped permanently and cannot be resumed.")
+            else:
+                send_message(target_id, "ℹ️ You had no active or queued tasks to stop.")
+        except Exception:
+            # If we can't send messages to the user (e.g. blocked), still proceed.
+            logger.exception("Failed to notify removed user %s", target_id)
+
         return jsonify({"ok": True})
 
     if command == "/listusers":
