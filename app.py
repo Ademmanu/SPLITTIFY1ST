@@ -2,13 +2,14 @@
 """
 Telegram Word-Splitter Bot (Webhook-ready) - app.py (integrated)
 
-This file includes:
-- Robust tg_call and token-bucket rate limiting.
-- robust_send_message wrapper (per-recipient retries, backoff, jitter).
-- Per-word confirmed-sends and retry loop with SPLIT_MAX_ATTEMPTS.
-- Idempotent /broadcast implementation with persistent broadcast_runs
-  and broadcast_recipients tables so successful deliveries are not re-sent.
-- Additional defensive error handling to reduce silent crashes.
+Changes:
+- Removed brittle retry_after parsing from tg_call.
+- Added a global cooldown for 429 responses to reduce repeated noise.
+- Broadcasts now record permanent failures for a given message hash and will NOT retry those recipients again;
+  the owner is informed with the failing user_id when a permanent failure is recorded.
+- Transient errors are retried up to BROADCAST_MAX_ATTEMPTS during the run; if they still fail they are marked
+  as failed for that run and the owner is informed. For the guarantee "never repeat failed broadcast" we treat
+  any final per-run failure as permanent for that message hash (so future runs skip them).
 """
 import os
 import time
@@ -375,33 +376,21 @@ def _consume_token(block=True, timeout=10.0):
         time.sleep(0.01)
 
 
-# --- Robust tg_call implementation ---
+# --- Robust tg_call implementation (simpler, no retry_after parsing) ---
 _tele_429_count = 0
+_tele_429_backoff_until = 0.0
+_tele_429_backoff_lock = threading.Lock()
 
 
-def _parse_retry_after_from_response(data, resp_text=""):
-    if isinstance(data, dict):
-        params = data.get("parameters") or {}
-        retry_after = params.get("retry_after") or data.get("retry_after")
-        if retry_after:
-            try:
-                return int(retry_after)
-            except Exception:
-                pass
-        desc = data.get("description") or ""
-        m = re.search(r"retry after (\d+)", desc, re.I)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                pass
-    m = re.search(r"retry after (\d+)", resp_text, re.I)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            pass
-    return None
+def _is_global_tele_cooldown():
+    with _tele_429_backoff_lock:
+        return time.time() < _tele_429_backoff_until
+
+
+def _set_global_tele_cooldown(seconds):
+    global _tele_429_backoff_until
+    with _tele_429_backoff_lock:
+        _tele_429_backoff_until = time.time() + seconds
 
 
 def tg_call(method: str, payload: dict):
@@ -409,6 +398,12 @@ def tg_call(method: str, payload: dict):
     if not TELEGRAM_API:
         logger.error("tg_call attempted but TELEGRAM_API not configured")
         return None
+
+    # If a global cooldown is active, sleep a small amount to avoid hammering
+    if _is_global_tele_cooldown():
+        wait_remaining = max(0.1, _tele_429_backoff_until - time.time())
+        logger.info("tg_call: global 429 cooldown active; sleeping %.2fs before call to %s", wait_remaining, method)
+        time.sleep(wait_remaining)
 
     url = f"{TELEGRAM_API}/{method}"
     max_retries = max(1, TG_CALL_MAX_RETRIES)
@@ -421,40 +416,37 @@ def tg_call(method: str, payload: dict):
 
         try:
             resp = _session.post(url, json=payload, timeout=REQUESTS_TIMEOUT)
+            http_status = resp.status_code
+            text_snippet = resp.text[:4000]
             try:
                 data = resp.json()
             except Exception:
-                data = None
+                data = {"ok": False, "description": f"non-json-response status={http_status}", "_raw_text": text_snippet}
+            if isinstance(data, dict):
+                data["_http_status"] = http_status
+                data["_raw_text"] = text_snippet
 
-            if resp.status_code == 429:
+            if http_status == 429:
                 _tele_429_count += 1
-                retry_after = _parse_retry_after_from_response(data, resp.text)
-                if retry_after is None:
-                    retry_after = backoff
-                logger.warning(
-                    "Telegram API 429 Too Many Requests (attempt %d/%d). retry_after=%s secs. method=%s",
-                    attempt, max_retries, retry_after, method,
-                )
-                sleep_time = min(max(0.5, float(retry_after)), TG_CALL_MAX_BACKOFF)
-                time.sleep(sleep_time)
+                # Global cooldown: use exponential backoff with jitter and cap
+                cooldown = min(backoff, TG_CALL_MAX_BACKOFF)
+                jitter = random.uniform(0, max(0.1, cooldown * 0.25))
+                total_sleep = cooldown + jitter
+                logger.warning("Telegram API 429 Too Many Requests (attempt %d/%d). setting global cooldown %.2fs (jitter %.2fs). method=%s",
+                               attempt, max_retries, total_sleep, jitter, method)
+                _set_global_tele_cooldown(total_sleep)
+                time.sleep(total_sleep)
                 backoff = min(backoff * 2, TG_CALL_MAX_BACKOFF)
                 continue
 
-            if 500 <= resp.status_code < 600:
-                logger.warning(
-                    "Telegram server error %s on attempt %d/%d. Retrying after %.1fs. method=%s",
-                    resp.status_code, attempt, max_retries, backoff, method,
-                )
+            if 500 <= http_status < 600:
+                logger.warning("Telegram server error %s on attempt %d/%d. Retrying after %.1fs. method=%s",
+                               http_status, attempt, max_retries, backoff, method)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, TG_CALL_MAX_BACKOFF)
                 continue
 
-            if data is None:
-                logger.error("tg_call: non-json response status=%s text=%s", resp.status_code, resp.text[:400])
-                return None
-
-            if not data.get("ok", False):
-                logger.error("Telegram API returned error: %s", data)
+            # Return parsed data (may have ok=False), attach http status for caller
             return data
 
         except requests.exceptions.RequestException:
@@ -471,8 +463,6 @@ def tg_call(method: str, payload: dict):
 def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
     """
     Low-level send wrapper. Returns the Telegram API result dict on success, or None on definite failure.
-    Note: this function itself already attempts to call Telegram with tg_call (which has retries for server-side/backoff).
-    We wrap it with robust_send_message above when we want client-level retries per-recipient.
     """
     payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
     try:
@@ -495,7 +485,6 @@ def robust_send_message(chat_id: int, text: str, parse_mode: str = "Markdown", a
     """
     Higher-level sending helper that retries per-recipient only when the send fails.
     Returns the Telegram API result dict on success, or None if all attempts failed.
-    Ensures that sent messages are only recorded on confirmed success (send_message does that).
     """
     if attempts <= 0:
         attempts = 1
@@ -504,12 +493,10 @@ def robust_send_message(chat_id: int, text: str, parse_mode: str = "Markdown", a
             res = send_message(chat_id, text, parse_mode=parse_mode)
             if res:
                 return res
-            # else failed; log and maybe retry
             logger.warning("robust_send_message: attempt %d/%d failed for chat %s", attempt, attempts, chat_id)
         except Exception:
             logger.exception("robust_send_message: exception on attempt %d for chat %s", attempt, chat_id)
         if attempt < attempts:
-            # exponential backoff with jitter
             backoff = base_backoff * (2 ** (attempt - 1))
             backoff = min(backoff, TG_CALL_MAX_BACKOFF)
             jitter = random.uniform(0, backoff * 0.2)
@@ -533,7 +520,6 @@ def send_to_owners(text: str, parse_mode: str = "Markdown"):
         return
     for oid in OWNERS:
         try:
-            # small retries for owner notifications to reduce lost-notice risk
             robust_send_message(oid, text, parse_mode=parse_mode, attempts=2)
         except Exception:
             logger.exception("Failed to send owner message to %s", oid)
@@ -1096,7 +1082,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         robust_send_message(user_id, "❌ Sorry, you are not allowed to use this bot. The owner has been notified.")
         # notify the primary owner (legacy behavior) and all owners
         try:
-            # keep legacy single-owner notify for compatibility and also notify all owners
             if OWNER_ID:
                 robust_send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
             send_to_owners(f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
@@ -1482,11 +1467,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
                 continue
             if target in previously_failed:
                 # Do NOT retry recipients that previously failed for the same message hash.
-                # Record them as failed for this run and inform the creating owner immediately.
                 db_execute("INSERT OR IGNORE INTO broadcast_recipients (run_id, user_id, status, attempts, last_attempt) VALUES (?, ?, 'failed', 0, ?)",
                            (run_id, target, get_now_iso()))
                 try:
-                    robust_send_message(user_id, f"⚠️ Broadcast not sent to {target} because previous attempts for this message failed. Not retrying.")
+                    robust_send_message(user_id, f"⚠️ Broadcast skipped for {target} — previously recorded failure for this message. Not retrying.")
                 except Exception:
                     logger.exception("Failed to notify broadcast creator about previously failed recipient %s", target)
                 continue
@@ -1502,38 +1486,95 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             attempts = int(row[2] or 0) if len(row) > 2 else 0
             sent_ok = False
             for attempt_no in range(attempts + 1, BROADCAST_MAX_ATTEMPTS + 1):
-                res = robust_send_message(target, f"📣 Broadcast from owner:\n\n{message}", attempts=1)
+                # Use tg_call directly via send_message-like behavior so we can inspect the response
+                payload = {"chat_id": target, "text": f"📣 Broadcast from owner:\n\n{message}", "parse_mode": "Markdown", "disable_web_page_preview": True}
+                resp = tg_call("sendMessage", payload)
                 attempts = attempt_no
                 db_execute("UPDATE broadcast_recipients SET attempts = ?, last_attempt = ? WHERE run_id = ? AND user_id = ?",
                            (attempts, get_now_iso(), run_id, target))
-                if res:
+                if resp and resp.get("ok"):
                     sent_ok = True
                     success_count += 1
+                    # record sent message if present
+                    try:
+                        result = resp.get("result") or {}
+                        mid = result.get("message_id")
+                        if mid:
+                            record_sent_message(target, mid)
+                    except Exception:
+                        logger.exception("Failed to record sent message for broadcast success %s", target)
                     mark_broadcast_recipient_status(run_id, target, "success", attempts)
                     break
-                else:
+
+                # If no response at all, treat as transient and retry until attempts exhausted
+                if resp is None:
                     if attempt_no < BROADCAST_MAX_ATTEMPTS:
                         backoff = ROBUST_SEND_BASE_BACKOFF * (2 ** (attempt_no - 1))
                         backoff = min(backoff, TG_CALL_MAX_BACKOFF)
                         time.sleep(backoff + (0.05 * attempt_no))
+                        continue
                     else:
-                        # final failure for this recipient in this run -> mark failed and inform creator immediately
+                        # final attempt exhausted in this run -> mark as failed and treat as permanent for this message hash (do not retry in future)
                         mark_broadcast_recipient_status(run_id, target, "failed", attempts)
                         failed_list.append(target)
                         try:
-                            robust_send_message(user_id, f"⚠️ Broadcast failed for recipient {target}. Will not retry this recipient for this message.")
+                            robust_send_message(user_id, f"⚠️ Broadcast failed for recipient {target}. Not retrying this recipient for this message.")
                         except Exception:
                             logger.exception("Failed to notify broadcast creator about failed recipient %s", target)
-                        # Also inform owners (aggregate owner notification still sent later)
+                        break
+
+                # resp is a dict and not ok -> inspect reason
+                status = resp.get("_http_status")
+                desc = (resp.get("description") or "").lower()
+                raw = (resp.get("_raw_text") or "").lower()
+                # treat 400/403 with blocked/not found/forbidden as permanent
+                permanent = False
+                if status in (400, 403):
+                    if "chat not found" in desc or "chat not found" in raw:
+                        permanent = True
+                    elif "bot was blocked" in desc or "bot was blocked" in raw or "blocked" in desc:
+                        permanent = True
+                    elif "user is deactivated" in desc or "user is deactivated" in raw:
+                        permanent = True
+                    elif "forbidden" in desc:
+                        permanent = True
+                    else:
+                        # treat 400/403 as permanent by default
+                        permanent = True
+
+                if permanent:
+                    mark_broadcast_recipient_status(run_id, target, "failed", attempts)
+                    failed_list.append(target)
+                    try:
+                        robust_send_message(user_id, f"⚠️ Broadcast failed permanently for recipient {target}. Not retrying this user for this message.")
+                    except Exception:
+                        logger.exception("Failed to notify broadcast creator about permanent failure %s", target)
+                    try:
+                        send_to_owners(f"⚠️ Broadcast run {run_id}: permanent failure to send to {target} (reason: {resp.get('description')}).")
+                    except Exception:
+                        logger.exception("Failed to notify owners about broadcast permanent failure")
+                    break
+                else:
+                    # transient error: retry unless exhausted; when exhausted mark as failed for run and treat as permanent per requirement (never repeat failed)
+                    if attempt_no < BROADCAST_MAX_ATTEMPTS:
+                        backoff = ROBUST_SEND_BASE_BACKOFF * (2 ** (attempt_no - 1))
+                        backoff = min(backoff, TG_CALL_MAX_BACKOFF)
+                        time.sleep(backoff + (0.05 * attempt_no))
+                        continue
+                    else:
+                        # final transient failure treated as permanent for this message hash (do not retry in future runs)
+                        mark_broadcast_recipient_status(run_id, target, "failed", attempts)
+                        failed_list.append(target)
                         try:
-                            send_to_owners(f"⚠️ Broadcast run {run_id}: failed to send to {target}")
+                            robust_send_message(user_id, f"⚠️ Broadcast could not be delivered to {target} in this run. Not retrying this recipient for this message.")
                         except Exception:
-                            logger.exception("Failed to notify owners about broadcast failure for %s", target)
+                            logger.exception("Failed to notify broadcast creator about final transient fail %s", target)
+                        break
 
         pre_skipped = len(already_done) + len(previously_failed)
         total_success = success_count + len(already_done)
 
-        robust_send_message(user_id, f"📣 Broadcast run {run_id} completed. Total recipients: {total_recipients}. Success: {total_success}. Failed: {len(failed_list)}. Previously failed/skipped: {len(previously_failed)}")
+        robust_send_message(user_id, f"📣 Broadcast run {run_id} completed. Total recipients: {total_recipients}. Success: {total_success}. Failed: {len(failed_list)}. Previously skipped: {len(previously_failed)}")
 
         if failed_list:
             try:
