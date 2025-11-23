@@ -2,14 +2,15 @@
 """
 Telegram Word-Splitter Bot (Webhook-ready) - app.py (updated)
 
-Changes in this version:
-- Support ALLOWED_USERS env var robustly (ALLOWED_USERS or fallback allowed_users) and insert those IDs into allowed_users at startup.
-- Send hourly reports and health notices to all configured owners (OWNER_IDS / OWNER_ID).
-- Automatic processing of expired suspensions:
-  - When a suspension expires, the user is notified that their suspension ended.
-  - All owners are notified that the user's suspension has been lifted.
-  - A scheduler job checks for expired suspensions every minute.
-- Emojified various user-facing replies (e.g. /listusers, /botinfo, usage messages, unknown command, etc.)
+Changes in this version (high level):
+- Robust per-recipient retry for /broadcast: only retries the failing recipients (up to BROADCAST_MAX_ATTEMPTS),
+  and never re-sends to already-successful recipients.
+- Robust per-send retry for splitting messages: each word send will be retried up to SPLIT_MAX_ATTEMPTS before
+  giving up on the task and notifying the user and owners.
+- Introduced robust_send_message(...) wrapper that retries the higher-level send_message call with exponential backoff,
+  and does not treat a transient failure as "sent" (so sent_count is only incremented on confirmed send).
+- Reduced crash probability by adding defensively-scoped try/except blocks around worker loops and critical paths.
+- Some minor performance/clarity improvements and configurable retry limits via env vars.
 """
 import os
 import time
@@ -24,6 +25,7 @@ from typing import List
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify
 import requests
+import random
 
 # Configure logging to stdout
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -58,6 +60,11 @@ _raw_max_msg_per_second = float(os.environ.get("MAX_MSG_PER_SECOND", "50"))
 MAX_MSG_PER_SECOND = max(50.0, _raw_max_msg_per_second)
 TG_CALL_MAX_RETRIES = int(os.environ.get("TG_CALL_MAX_RETRIES", "5"))
 TG_CALL_MAX_BACKOFF = float(os.environ.get("TG_CALL_MAX_BACKOFF", "60"))  # seconds
+
+# New configuration for per-recipient retries
+BROADCAST_MAX_ATTEMPTS = int(os.environ.get("BROADCAST_MAX_ATTEMPTS", "3"))
+SPLIT_MAX_ATTEMPTS = int(os.environ.get("SPLIT_MAX_ATTEMPTS", "3"))
+ROBUST_SEND_BASE_BACKOFF = float(os.environ.get("ROBUST_SEND_BASE_BACKOFF", "1.0"))  # seconds
 
 if not TELEGRAM_TOKEN or not WEBHOOK_URL or not OWNER_ID:
     logger.warning("TELEGRAM_TOKEN, WEBHOOK_URL, OWNER_ID (or OWNER_IDS) should be set in environment.")
@@ -344,7 +351,7 @@ def _consume_token(block=True, timeout=10.0):
         time.sleep(0.01)
 
 
-# --- Robust tg_call implementation ---
+# --- Robust tg_call implementation (unchanged) ---
 _tele_429_count = 0
 
 
@@ -438,13 +445,52 @@ def tg_call(method: str, payload: dict):
 
 # Telegram API helpers that use tg_call
 def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
+    """
+    Low-level send wrapper. Returns the Telegram API result dict on success, or None on definite failure.
+    Note: this function itself already attempts to call Telegram with tg_call (which has retries for server-side/backoff).
+    We wrap it with robust_send_message above when we want client-level retries per-recipient.
+    """
     payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
-    data = tg_call("sendMessage", payload)
+    try:
+        data = tg_call("sendMessage", payload)
+    except Exception:
+        logger.exception("send_message: tg_call raised exception")
+        data = None
     if data and data.get("result"):
         mid = data["result"].get("message_id")
         if mid:
-            record_sent_message(chat_id, mid)
+            try:
+                record_sent_message(chat_id, mid)
+            except Exception:
+                logger.exception("Failed to record sent message for %s:%s", chat_id, mid)
         return data["result"]
+    return None
+
+
+def robust_send_message(chat_id: int, text: str, parse_mode: str = "Markdown", attempts: int = 3, base_backoff: float = ROBUST_SEND_BASE_BACKOFF):
+    """
+    Higher-level sending helper that retries per-recipient only when the send fails.
+    Returns the Telegram API result dict on success, or None if all attempts failed.
+    Ensures that sent messages are only recorded on confirmed success (send_message does that).
+    """
+    if attempts <= 0:
+        attempts = 1
+    for attempt in range(1, attempts + 1):
+        try:
+            res = send_message(chat_id, text, parse_mode=parse_mode)
+            if res:
+                return res
+            # else failed; log and maybe retry
+            logger.warning("robust_send_message: attempt %d/%d failed for chat %s", attempt, attempts, chat_id)
+        except Exception:
+            logger.exception("robust_send_message: exception on attempt %d for chat %s", attempt, chat_id)
+        if attempt < attempts:
+            # exponential backoff with jitter
+            backoff = base_backoff * (2 ** (attempt - 1))
+            backoff = min(backoff, TG_CALL_MAX_BACKOFF)
+            jitter = random.uniform(0, backoff * 0.2)
+            time.sleep(backoff + jitter)
+    logger.error("robust_send_message: all %d attempts failed for chat %s", attempts, chat_id)
     return None
 
 
@@ -456,14 +502,15 @@ def delete_message(chat_id: int, message_id: int):
     return data
 
 
-# helper: send same message to all configured owners
+# helper: send same message to all configured owners (use robust send with modest attempts)
 def send_to_owners(text: str, parse_mode: str = "Markdown"):
     if not OWNERS:
         logger.warning("send_to_owners: no owners configured")
         return
     for oid in OWNERS:
         try:
-            send_message(oid, text, parse_mode=parse_mode)
+            # small retries for owner notifications to reduce lost-notice risk
+            robust_send_message(oid, text, parse_mode=parse_mode, attempts=2)
         except Exception:
             logger.exception("Failed to send owner message to %s", oid)
 
@@ -482,7 +529,7 @@ def set_webhook():
         return None
 
 
-# Task management functions (unchanged)
+# Task management functions (unchanged except uses of robust_send_message where needed)
 def enqueue_task(user_id: int, username: str, text: str) -> dict:
     words = split_text_into_words(text)
     total = len(words)
@@ -637,7 +684,7 @@ def process_expired_suspensions_notify():
                 logger.exception("Failed to remove expired suspension for %s", uid)
             # notify user
             try:
-                send_message(uid, f"✅ Your suspension ended at {until} UTC. You can use the bot again.")
+                robust_send_message(uid, f"✅ Your suspension ended at {until} UTC. You can use the bot again.")
             except Exception:
                 logger.exception("Failed to notify user about suspension end %s", uid)
             # notify all owners
@@ -709,83 +756,151 @@ _worker_stop = threading.Event()
 
 
 def process_user_queue(user_id: int, chat_id: int, username: str):
+    """
+    Worker that processes queued tasks for a single user. Each word send is attempted via robust_send_message;
+    only when a send is confirmed do we increment sent_count. On repeated failures for the same recipient we
+    pause/cancel the task and notify both the user and owners so manual intervention can occur.
+    """
     lock = get_user_lock(user_id)
     if not lock.acquire(blocking=False):
         return
     try:
         while True:
-            task = get_next_task_for_user(user_id)
-            if not task:
-                break
-            # If user became suspended while tasks queued, cancel their tasks
-            if is_suspended(user_id):
-                # cancel all queued/running/paused tasks for this user and notify them
-                stopped = cancel_active_task_for_user(user_id)
-                try:
-                    send_message(chat_id, "❌ You have been suspended; your tasks were stopped.")
-                except Exception:
-                    logger.exception("Failed to notify suspended user %s", user_id)
-                break
-
-            task_id = task["id"]
-            words = task["words"]
-            total = task["total_words"]
-            set_task_status(task_id, "running")
-            qcount = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
-            interval = compute_interval(total)
-            sent_info = db_execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,), fetch=True)
-            sent = int(sent_info[0][0] or 0) if sent_info else 0
-            remaining = max(0, total - sent)
-            est_seconds = interval * remaining
-            est_str = str(timedelta(seconds=int(est_seconds)))
-            start_msg = f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}."
-            if qcount:
-                start_msg += f" There are {qcount} more task(s) waiting."
-            send_message(chat_id, start_msg)
-            i = sent
-            while i < total:
-                status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
-                if not status_row:
+            try:
+                task = get_next_task_for_user(user_id)
+                if not task:
                     break
-                status = status_row[0][0]
-                if status == "paused":
-                    send_message(chat_id, "⏸️ Task paused. Use /resume to continue.")
-                    while True:
-                        time.sleep(0.5)
-                        status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
-                        if not status_row:
-                            break
-                        status = status_row[0][0]
-                        if status == "running":
-                            send_message(chat_id, "▶️ Resuming your task.")
-                            break
+                # If user became suspended while tasks queued, cancel their tasks
+                if is_suspended(user_id):
+                    # cancel all queued/running/paused tasks for this user and notify them
+                    stopped = cancel_active_task_for_user(user_id)
+                    try:
+                        robust_send_message(chat_id, "❌ You have been suspended; your tasks were stopped.")
+                    except Exception:
+                        logger.exception("Failed to notify suspended user %s", user_id)
+                    break
+
+                task_id = task["id"]
+                words = task["words"]
+                total = task["total_words"]
+                # mark running
+                set_task_status(task_id, "running")
+                qcount = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
+                interval = compute_interval(total)
+                sent_info = db_execute("SELECT sent_count FROM tasks WHERE id = ?", (task_id,), fetch=True)
+                sent = int(sent_info[0][0] or 0) if sent_info else 0
+                remaining = max(0, total - sent)
+                est_seconds = interval * remaining
+                est_str = str(timedelta(seconds=int(est_seconds)))
+                start_msg = f"🚀 Starting your split now. Words: {total}. Estimated time: {est_str}."
+                if qcount:
+                    start_msg += f" There are {qcount} more task(s) waiting."
+                robust_send_message(chat_id, start_msg)
+
+                i = sent
+                # For per-word failures count attempts separately to decide on giving up
+                consecutive_failures_for_recipient = 0
+                while i < total:
+                    # Refresh status
+                    status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
+                    if not status_row:
+                        break
+                    status = status_row[0][0]
+                    if status == "paused":
+                        robust_send_message(chat_id, "⏸️ Task paused. Use /resume to continue.")
+                        while True:
+                            time.sleep(0.5)
+                            status_row = db_execute("SELECT status FROM tasks WHERE id = ?", (task_id,), fetch=True)
+                            if not status_row:
+                                break
+                            status = status_row[0][0]
+                            if status == "running":
+                                robust_send_message(chat_id, "▶️ Resuming your task.")
+                                break
+                            if status == "cancelled":
+                                break
                         if status == "cancelled":
                             break
                     if status == "cancelled":
                         break
-                if status == "cancelled":
-                    break
-                # Before each send check if user suspended now
-                if is_suspended(user_id):
-                    send_message(chat_id, "❌ You have been suspended; stopping your task.")
-                    cancel_active_task_for_user(user_id)
-                    break
-                send_message(chat_id, words[i])
-                db_execute("UPDATE tasks SET sent_count = sent_count + 1 WHERE id = ?", (task_id,))
-                i += 1
-                time.sleep(interval)
-            final_status_row = db_execute("SELECT status, sent_count, total_words FROM tasks WHERE id = ?", (task_id,), fetch=True)
-            final_status = final_status_row[0][0] if final_status_row else "done"
-            sent_count = int(final_status_row[0][1] or 0) if final_status_row else total
-            if final_status != "cancelled":
-                mark_task_done(task_id)
-                record_split_log(user_id, username, sent_count)
-                send_message(chat_id, "✅ All done! Your text was split.")
-            else:
-                send_message(chat_id, "🛑 Task stopped.")
-            qcount_after = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
-            if qcount_after > 0:
-                send_message(chat_id, "⏩ Next task will start soon!")
+                    # Before each send check if user suspended now
+                    if is_suspended(user_id):
+                        robust_send_message(chat_id, "❌ You have been suspended; stopping your task.")
+                        cancel_active_task_for_user(user_id)
+                        break
+
+                    word = words[i]
+                    sent_ok = False
+                    for attempt in range(1, SPLIT_MAX_ATTEMPTS + 1):
+                        res = robust_send_message(chat_id, word, attempts=1)  # robust_send_message already does attempts; here use 1 to control loop
+                        if res:
+                            sent_ok = True
+                            consecutive_failures_for_recipient = 0
+                            try:
+                                db_execute("UPDATE tasks SET sent_count = sent_count + 1 WHERE id = ?", (task_id,))
+                            except Exception:
+                                logger.exception("Failed to update sent_count for task %s", task_id)
+                            break
+                        else:
+                            # small backoff before retrying the current word
+                            backoff = ROBUST_SEND_BASE_BACKOFF * (2 ** (attempt - 1))
+                            backoff = min(backoff, TG_CALL_MAX_BACKOFF)
+                            jitter = random.uniform(0, backoff * 0.2)
+                            time.sleep(backoff + jitter)
+                    if not sent_ok:
+                        consecutive_failures_for_recipient += 1
+                        logger.error("Failed to send word #%d for user %s after %d attempts. Pausing/cancelling task %s", i, user_id, SPLIT_MAX_ATTEMPTS, task_id)
+                        # After repeated failures for same recipient, stop trying further to avoid spamming and notify owners
+                        if consecutive_failures_for_recipient >= 3:
+                            set_task_status(task_id, "paused")
+                            try:
+                                robust_send_message(chat_id, "⚠️ Repeated send failures occurred. Your task has been paused. The owner has been notified.")
+                            except Exception:
+                                logger.exception("Failed to notify user about repeated failures")
+                            try:
+                                send_to_owners(f"⚠️ Repeated send failures for user {user_id} while processing task {task_id}. Paused the task.")
+                            except Exception:
+                                logger.exception("Failed to notify owners about repeated failures")
+                            break
+                        else:
+                            # give a small breather and continue to next word attempt cycle
+                            time.sleep(1.0)
+                            continue
+
+                    # if successful, advance
+                    i += 1
+                    # Sleep respecting the sending interval
+                    time.sleep(interval)
+
+                # finalize task if not cancelled/paused
+                final_status_row = db_execute("SELECT status, sent_count, total_words FROM tasks WHERE id = ?", (task_id,), fetch=True)
+                final_status = final_status_row[0][0] if final_status_row else "done"
+                sent_count = int(final_status_row[0][1] or 0) if final_status_row else total
+                if final_status != "cancelled" and final_status != "paused":
+                    mark_task_done(task_id)
+                    try:
+                        record_split_log(user_id, username, sent_count)
+                    except Exception:
+                        logger.exception("Failed to record split log for %s", user_id)
+                    robust_send_message(chat_id, "✅ All done! Your text was split.")
+                elif final_status == "paused":
+                    robust_send_message(chat_id, "⏸️ Your task is paused due to send failures or by request. Use /resume to continue.")
+                else:
+                    robust_send_message(chat_id, "🛑 Task stopped.")
+                qcount_after = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
+                if qcount_after > 0:
+                    robust_send_message(chat_id, "⏩ Next task will start soon!")
+            except Exception:
+                # Ensure we don't let unexpected exceptions kill the per-user worker loop
+                logger.exception("Unexpected exception in process_user_queue for user %s", user_id)
+                try:
+                    robust_send_message(user_id, "⚠️ An internal error occurred while processing your tasks. The owner has been notified.")
+                    send_to_owners(f"⚠️ Internal error while processing tasks for user {user_id}. See logs for details.")
+                except Exception:
+                    logger.exception("Failed to notify about internal error")
+                # avoid tight loop in case of persistent failure
+                time.sleep(2)
+                break
     finally:
         lock.release()
 
@@ -795,10 +910,14 @@ def global_worker_loop():
         try:
             rows = db_execute("SELECT DISTINCT user_id, username FROM tasks WHERE status = 'queued' ORDER BY created_at ASC", fetch=True)
             for r in rows:
-                user_id = r[0]
-                username = r[1] or ""
-                t = threading.Thread(target=process_user_queue, args=(user_id, user_id, username), daemon=True)
-                t.start()
+                try:
+                    user_id = r[0]
+                    username = r[1] or ""
+                    # chat_id == user_id for 1:1 bot
+                    t = threading.Thread(target=process_user_queue, args=(user_id, user_id, username), daemon=True)
+                    t.start()
+                except Exception:
+                    logger.exception("Failed to start per-user worker for row: %s", r)
             time.sleep(0.5)
         except Exception:
             traceback.print_exc()
@@ -833,7 +952,11 @@ def delete_old_bot_messages():
         try:
             delete_message(m["chat_id"], m["message_id"])
         except Exception:
-            mark_message_deleted(m["chat_id"], m["message_id"])
+            # mark as deleted to avoid retrying forever
+            try:
+                mark_message_deleted(m["chat_id"], m["message_id"])
+            except Exception:
+                logger.exception("Failed to mark message deleted in DB: %s", m)
 
 
 def maintenance_hourly_health():
@@ -882,12 +1005,12 @@ def webhook():
 def handle_command(user_id: int, username: str, command: str, args: str):
     # allow /start and /help for anyone; otherwise check allowed (and suspended)
     if not is_allowed(user_id) and command not in ("/start", "/help"):
-        send_message(user_id, "❌ Sorry, you are not allowed to use this bot. The owner has been notified.")
+        robust_send_message(user_id, "❌ Sorry, you are not allowed to use this bot. The owner has been notified.")
         # notify the primary owner (legacy behavior) and all owners
         try:
             # keep legacy single-owner notify for compatibility and also notify all owners
             if OWNER_ID:
-                send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
+                robust_send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
             send_to_owners(f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}).")
         except Exception:
             logger.exception("Failed to notify owner(s) about unallowed access")
@@ -902,39 +1025,39 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             "User commands: /start /example /pause /resume /status /stop /stats /about\n"
             "Just send any text and I'll split it for you."
         )
-        send_message(user_id, body)
+        robust_send_message(user_id, body)
         return jsonify({"ok": True})
 
     if command == "/example":
         sample = "This is a demo split"
-        send_message(user_id, "🎯 Running a short example...")
+        robust_send_message(user_id, "🎯 Running a short example...")
         res = enqueue_task(user_id, username, sample)
         running_exists = bool(db_execute("SELECT 1 FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,), fetch=True))
         queued = db_execute("SELECT COUNT(*) FROM tasks WHERE user_id = ? AND status = 'queued'", (user_id,), fetch=True)[0][0]
         if running_exists:
-            send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
+            robust_send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
         else:
-            send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
+            robust_send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
         return jsonify({"ok": True})
 
     if command == "/pause":
         rows = db_execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'running' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
         if not rows:
-            send_message(user_id, "❌ No active task to pause.")
+            robust_send_message(user_id, "❌ No active task to pause.")
             return jsonify({"ok": True})
         task_id = rows[0][0]
         mark_task_paused(task_id)
-        send_message(user_id, "⏸️ Paused. Use /resume to continue.")
+        robust_send_message(user_id, "⏸️ Paused. Use /resume to continue.")
         return jsonify({"ok": True})
 
     if command == "/resume":
         rows = db_execute("SELECT id FROM tasks WHERE user_id = ? AND status = 'paused' ORDER BY started_at ASC LIMIT 1", (user_id,), fetch=True)
         if not rows:
-            send_message(user_id, "❌ No paused task to resume.")
+            robust_send_message(user_id, "❌ No paused task to resume.")
             return jsonify({"ok": True})
         task_id = rows[0][0]
         mark_task_resumed(task_id)
-        send_message(user_id, "▶️ Resuming your task now.")
+        robust_send_message(user_id, "▶️ Resuming your task now.")
         return jsonify({"ok": True})
 
     if command == "/status":
@@ -943,12 +1066,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if active:
             aid, status, total_words, sent_count = active[0]
             remaining = int(total_words or 0) - int(sent_count or 0)
-            send_message(user_id, f"📊 Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
+            robust_send_message(user_id, f"📊 Status: {status}\nRemaining words: {remaining}\nQueue size: {queued}")
         else:
             if queued > 0:
-                send_message(user_id, f"📝 Waiting. Your first task is in line. Queue size: {queued}")
+                robust_send_message(user_id, f"📝 Waiting. Your first task is in line. Queue size: {queued}")
             else:
-                send_message(user_id, "📊 You have no active or queued tasks.")
+                robust_send_message(user_id, "📊 You have no active or queued tasks.")
         return jsonify({"ok": True})
 
     if command == "/stop":
@@ -956,12 +1079,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         queued_count = queued_rows[0][0] if queued_rows else 0
         stopped = cancel_active_task_for_user(user_id)
         if stopped > 0:
-            send_message(user_id, "🛑 Active task stopped. Your queued tasks were cleared too.")
+            robust_send_message(user_id, "🛑 Active task stopped. Your queued tasks were cleared too.")
         elif queued_count > 0:
             db_execute("UPDATE tasks SET status = 'cancelled' WHERE user_id = ? AND status = 'queued'", (user_id,))
-            send_message(user_id, f"🛑 Cleared {queued_count} queued task(s).")
+            robust_send_message(user_id, f"🛑 Cleared {queued_count} queued task(s).")
         else:
-            send_message(user_id, "ℹ️ You had no active or queued tasks.")
+            robust_send_message(user_id, "ℹ️ You had no active or queued tasks.")
         return jsonify({"ok": True})
 
     # /stats now shows only the requesting user's words split in the last 12 hours
@@ -969,7 +1092,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         cutoff = datetime.utcnow() - timedelta(hours=12)
         rows = db_execute("SELECT SUM(words) FROM split_logs WHERE user_id = ? AND created_at >= ?", (user_id, cutoff.isoformat()), fetch=True)
         words = int(rows[0][0] or 0) if rows else 0
-        send_message(user_id, f"🕰️ Your last 12 hours: {words} words split. Nice!")
+        robust_send_message(user_id, f"🕰️ Your last 12 hours: {words} words split. Nice!")
         return jsonify({"ok": True})
 
     if command == "/about":
@@ -977,16 +1100,16 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             "ℹ️ About:\nI split texts into single-word messages. Features: queueing, pause/resume, hourly owner stats, auto-delete old bot messages.\n"
             f"Developer: @{OWNER_USERNAME}"
         )
-        send_message(user_id, body)
+        robust_send_message(user_id, body)
         return jsonify({"ok": True})
 
     # Admin commands (admins + owner)
     if command == "/adduser":
         if not is_admin(user_id):
-            send_message(user_id, "❌ You are not allowed to use this.")
+            robust_send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "ℹ️ Usage: /adduser <telegram_user_id> [username]  OR /adduser <id1> <id2> <id3>\nYou can separate IDs with spaces or commas.")
+            robust_send_message(user_id, "ℹ️ Usage: /adduser <telegram_user_id> [username]  OR /adduser <id1> <id2> <id3>\nYou can separate IDs with spaces or commas.")
             return jsonify({"ok": True})
 
         # Support multiple IDs in one message. Accept commas or spaces.
@@ -997,18 +1120,18 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             try:
                 target_id = int(parts[0])
             except Exception:
-                send_message(user_id, "❌ Invalid user id. Must be numeric.")
+                robust_send_message(user_id, "❌ Invalid user id. Must be numeric.")
                 return jsonify({"ok": True})
             uname = parts[1]
             count_total = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
             if count_total >= MAX_ALLOWED_USERS:
-                send_message(user_id, f"❌ Cannot add more users. Max: {MAX_ALLOWED_USERS}")
+                robust_send_message(user_id, f"❌ Cannot add more users. Max: {MAX_ALLOWED_USERS}")
                 return jsonify({"ok": True})
             db_execute("INSERT OR REPLACE INTO allowed_users (user_id, username, added_at, is_admin) VALUES (?, ?, ?, ?)",
                        (target_id, uname, get_now_iso(), 0))
-            send_message(user_id, f"✅ User {target_id} added.")
+            robust_send_message(user_id, f"✅ User {target_id} added.")
             try:
-                send_message(target_id, "✅ You have been added. Send any text to start.")
+                robust_send_message(target_id, "✅ You have been added. Send any text to start.")
             except Exception:
                 logger.exception("Failed to notify newly added user %s", target_id)
             return jsonify({"ok": True})
@@ -1059,12 +1182,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if failed:
             parts_msgs.append(f"⚠️ Failed: {', '.join(str(x[0]) + '(' + x[1] + ')' for x in failed)}")
 
-        send_message(user_id, "✅ /adduser results:\n" + ("\n".join(parts_msgs) if parts_msgs else "(no changes)"))
+        robust_send_message(user_id, "✅ /adduser results:\n" + ("\n".join(parts_msgs) if parts_msgs else "(no changes)"))
 
         # Try to notify newly added users
         for tid in added:
             try:
-                send_message(tid, "✅ You have been added. Send any text to start.")
+                robust_send_message(tid, "✅ You have been added. Send any text to start.")
             except Exception:
                 logger.exception("Failed to notify newly added user %s", tid)
 
@@ -1072,7 +1195,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 
     if command == "/listusers":
         if not is_admin(user_id):
-            send_message(user_id, "❌ You are not allowed to use this.")
+            robust_send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         rows = db_execute("SELECT user_id, username, is_admin, added_at FROM allowed_users", fetch=True)
         lines = []
@@ -1083,37 +1206,37 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             admin_mark = "🛡️" if is_admin_flag else ""
             lines.append(f"{uid} {uname} {admin_mark} added={r[3]}")
         body = "👥 Allowed users:\n" + ("\n".join(lines) if lines else "(none)")
-        send_message(user_id, body)
+        robust_send_message(user_id, body)
         return jsonify({"ok": True})
 
     # Owner-only: /suspend and /unsuspend
     if command == "/suspend":
         if user_id not in OWNERS:
-            send_message(user_id, "❌ Only the owner(s) can suspend users.")
+            robust_send_message(user_id, "❌ Only the owner(s) can suspend users.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "ℹ️ Usage: /suspend <telegram_user_id> [duration]\nDuration examples: 1h, 30m, 3600 (seconds). Default: 1h")
+            robust_send_message(user_id, "ℹ️ Usage: /suspend <telegram_user_id> [duration]\nDuration examples: 1h, 30m, 3600 (seconds). Default: 1h")
             return jsonify({"ok": True})
         parts = args.split(None, 1)
         try:
             target_id = int(parts[0])
         except Exception:
-            send_message(user_id, "❌ Invalid user id.")
+            robust_send_message(user_id, "❌ Invalid user id.")
             return jsonify({"ok": True})
         duration_seconds = None
         if len(parts) > 1 and parts[1].strip():
             duration_seconds = parse_duration_to_seconds(parts[1].strip())
             if duration_seconds is None:
-                send_message(user_id, "❌ Invalid duration. Use e.g. 1h, 30m, 3600 (seconds), 1d.")
+                robust_send_message(user_id, "❌ Invalid duration. Use e.g. 1h, 30m, 3600 (seconds), 1d.")
                 return jsonify({"ok": True})
         else:
             duration_seconds = 3600  # default 1 hour
 
         until = datetime.utcnow() + timedelta(seconds=duration_seconds)
         suspend_user_in_db(target_id, until.isoformat(), added_by=user_id, reason="")
-        send_message(user_id, f"✅ User {target_id} suspended until {until.isoformat()} UTC.")
+        robust_send_message(user_id, f"✅ User {target_id} suspended until {until.isoformat()} UTC.")
         try:
-            send_message(target_id, f"❌ You have been suspended until {until.isoformat()} UTC. Contact the owner for more info.")
+            robust_send_message(target_id, f"❌ You have been suspended until {until.isoformat()} UTC. Contact the owner for more info.")
         except Exception:
             logger.exception("Failed to notify suspended user %s", target_id)
         # notify all owners about the suspension action
@@ -1125,24 +1248,24 @@ def handle_command(user_id: int, username: str, command: str, args: str):
 
     if command == "/unsuspend":
         if user_id not in OWNERS:
-            send_message(user_id, "❌ Only the owner(s) can unsuspend users.")
+            robust_send_message(user_id, "❌ Only the owner(s) can unsuspend users.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "ℹ️ Usage: /unsuspend <telegram_user_id>")
+            robust_send_message(user_id, "ℹ️ Usage: /unsuspend <telegram_user_id>")
             return jsonify({"ok": True})
         try:
             target_id = int(args.split()[0])
         except Exception:
-            send_message(user_id, "❌ Invalid user id.")
+            robust_send_message(user_id, "❌ Invalid user id.")
             return jsonify({"ok": True})
         row = get_suspended_row(target_id)
         if not row:
-            send_message(user_id, f"ℹ️ User {target_id} is not suspended.")
+            robust_send_message(user_id, f"ℹ️ User {target_id} is not suspended.")
             return jsonify({"ok": True})
         unsuspend_user_in_db(target_id)
-        send_message(user_id, f"✅ User {target_id} unsuspended.")
+        robust_send_message(user_id, f"✅ User {target_id} unsuspended.")
         try:
-            send_message(target_id, "✅ You have been unsuspended and can use the bot again.")
+            robust_send_message(target_id, "✅ You have been unsuspended and can use the bot again.")
         except Exception:
             logger.exception("Failed to notify unsuspended user %s", target_id)
         # notify all owners that manual unsuspend occurred (user and invoking owner already notified)
@@ -1155,12 +1278,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     # Admin + owner: list suspended users
     if command == "/listsuspended":
         if not is_admin(user_id):
-            send_message(user_id, "❌ You are not allowed to use this.")
+            robust_send_message(user_id, "❌ You are not allowed to use this.")
             return jsonify({"ok": True})
         cleanup_expired_suspensions()
         rows = db_execute("SELECT user_id, suspended_until, reason, added_by, added_at FROM suspended_users ORDER BY suspended_until ASC", fetch=True)
         if not rows:
-            send_message(user_id, "✅ No suspended users.")
+            robust_send_message(user_id, "✅ No suspended users.")
             return jsonify({"ok": True})
         lines = []
         for r in rows:
@@ -1170,12 +1293,12 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             added_by = r[3] or ""
             added_at = r[4] or ""
             lines.append(f"⛔ {uid} suspended_until={until} by={added_by} at={added_at} reason={reason}")
-        send_message(user_id, "⛔ Suspended users:\n" + "\n".join(lines))
+        robust_send_message(user_id, "⛔ Suspended users:\n" + "\n".join(lines))
         return jsonify({"ok": True})
 
     if command == "/botinfo":
         if user_id not in OWNERS:
-            send_message(user_id, "❌ Only the bot owner(s) can use /botinfo")
+            robust_send_message(user_id, "❌ Only the bot owner(s) can use /botinfo")
             return jsonify({"ok": True})
         total_allowed = db_execute("SELECT COUNT(*) FROM allowed_users", fetch=True)[0][0]
         active_tasks = db_execute("SELECT COUNT(*) FROM tasks WHERE status IN ('running','paused')", fetch=True)[0][0]
@@ -1235,26 +1358,38 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             "\n".join(stats_lines) if stats_lines else "No activity in the last 1h",
         ]
         body = "\n".join(body_parts)
-        send_message(user_id, body)
+        robust_send_message(user_id, body)
         return jsonify({"ok": True})
 
     if command == "/broadcast":
         if user_id not in OWNERS:
-            send_message(user_id, "❌ Only owner can broadcast")
+            robust_send_message(user_id, "❌ Only owner can broadcast")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "ℹ️ Usage: /broadcast <message>")
+            robust_send_message(user_id, "ℹ️ Usage: /broadcast <message>")
             return jsonify({"ok": True})
-        rows = db_execute("SELECT user_id FROM allowed_users", fetch=True)
+        rows = db_execute("SELECT user_id FROM allowed_users", fetch=True) or []
         count = 0
-        fails = 0
+        fails = []
+        # For each recipient attempt up to BROADCAST_MAX_ATTEMPTS; successful recipients won't be retried.
         for r in rows:
+            target = r[0]
             try:
-                send_message(r[0], f"📣 Broadcast from owner:\n\n{args}")
-                count += 1
+                res = robust_send_message(target, f"📣 Broadcast from owner:\n\n{args}", attempts=BROADCAST_MAX_ATTEMPTS)
+                if res:
+                    count += 1
+                else:
+                    fails.append(target)
             except Exception:
-                fails += 1
-        send_message(user_id, f"📣 Broadcast done. Success: {count}, Failed: {fails}")
+                logger.exception("Broadcast failed for %s", target)
+                fails.append(target)
+        robust_send_message(user_id, f"📣 Broadcast done. Success: {count}, Failed: {len(fails)}")
+        if fails:
+            # give an explicit list of failed recipients (may be large)
+            try:
+                send_to_owners(f"⚠️ Broadcast had failures for recipients: {', '.join(str(x) for x in fails)}")
+            except Exception:
+                logger.exception("Failed to notify owners about broadcast failures")
         return jsonify({"ok": True})
 
     send_message(user_id, "❓ Unknown command.")
@@ -1268,16 +1403,16 @@ def get_queue_size(user_id):
 
 def handle_new_text(user_id: int, username: str, text: str):
     if not is_allowed(user_id):
-        send_message(user_id, "❌ Sorry, you are not allowed. The owner has been notified.")
+        robust_send_message(user_id, "❌ Sorry, you are not allowed. The owner has been notified.")
         try:
             if OWNER_ID:
-                send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
+                robust_send_message(OWNER_ID, f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
             send_to_owners(f"⚠️ Unallowed access attempt by {username or user_id} ({user_id}). Message: {text}")
         except Exception:
             logger.exception("Failed to notify owner about unallowed message")
         return jsonify({"ok": True})
     if is_maintenance_now():
-        send_message(user_id, "🛠️ Maintenance in progress. New tasks are blocked. Please try later.")
+        robust_send_message(user_id, "🛠️ Maintenance in progress. New tasks are blocked. Please try later.")
         try:
             send_to_owners(f"🛠️ Maintenance attempt by {user_id}.")
         except Exception:
@@ -1286,17 +1421,17 @@ def handle_new_text(user_id: int, username: str, text: str):
     res = enqueue_task(user_id, username, text)
     if not res["ok"]:
         if res.get("reason") == "empty":
-            send_message(user_id, "⚠️ Empty text. Nothing to split.")
+            robust_send_message(user_id, "⚠️ Empty text. Nothing to split.")
             return jsonify({"ok": True})
         if res.get("reason") == "queue_full":
-            send_message(user_id, f"❌ Your queue is full ({res['queue_size']}). Use /stop or wait.")
+            robust_send_message(user_id, f"❌ Your queue is full ({res['queue_size']}). Use /stop or wait.")
             return jsonify({"ok": True})
     running_exists = bool(db_execute("SELECT 1 FROM tasks WHERE user_id = ? AND status IN ('running','paused')", (user_id,), fetch=True))
     queued = get_queue_size(user_id)
     if running_exists:
-        send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
+        robust_send_message(user_id, f"📝 Queued. You have {queued} task(s) waiting.")
     else:
-        send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
+        robust_send_message(user_id, f"✅ Task added. Words: {res['total_words']}.")
     return jsonify({"ok": True})
 
 
@@ -1330,6 +1465,26 @@ def debug_routes():
     except Exception:
         logger.exception("Failed to list routes")
         return jsonify({"ok": False, "error": "failed to list routes"}), 500
+
+
+# handle_update used by root forward. Keep minimal to not duplicate logic.
+def handle_update(update_json):
+    try:
+        if "message" in update_json:
+            msg = update_json["message"]
+            user = msg.get("from", {})
+            user_id = user.get("id")
+            username = user.get("username") or user.get("first_name") or ""
+            text = msg.get("text") or ""
+            if text.startswith("/"):
+                parts = text.split(None, 1)
+                command = parts[0].split("@")[0].lower()
+                args = parts[1] if len(parts) > 1 else ""
+                handle_command(user_id, username, command, args)
+            else:
+                handle_new_text(user_id, username, text)
+    except Exception:
+        logger.exception("Error in handle_update")
 
 
 if __name__ == "__main__":
