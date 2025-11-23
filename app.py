@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-Telegram Word-Splitter Bot (Webhook-ready) - app.py (updated)
+Telegram Word-Splitter Bot (Webhook-ready) - app.py (integrated)
 
-Changes in this version (high level):
-- Robust per-recipient retry for /broadcast: only retries the failing recipients (up to BROADCAST_MAX_ATTEMPTS),
-  and never re-sends to already-successful recipients.
-- Robust per-send retry for splitting messages: each word send will be retried up to SPLIT_MAX_ATTEMPTS before
-  giving up on the task and notifying the user and owners.
-- Introduced robust_send_message(...) wrapper that retries the higher-level send_message call with exponential backoff,
-  and does not treat a transient failure as "sent" (so sent_count is only incremented on confirmed send).
-- Reduced crash probability by adding defensively-scoped try/except blocks around worker loops and critical paths.
-- Some minor performance/clarity improvements and configurable retry limits via env vars.
+This file includes:
+- Robust tg_call and token-bucket rate limiting.
+- robust_send_message wrapper (per-recipient retries, backoff, jitter).
+- Per-word confirmed-sends and retry loop with SPLIT_MAX_ATTEMPTS.
+- Idempotent /broadcast implementation with persistent broadcast_runs
+  and broadcast_recipients tables so successful deliveries are not re-sent.
+- Additional defensive error handling to reduce silent crashes.
 """
 import os
 import time
@@ -20,6 +18,8 @@ import threading
 import traceback
 import logging
 import re
+import uuid
+import hashlib
 from datetime import datetime, timedelta
 from typing import List
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -143,6 +143,30 @@ def init_db():
                 reason TEXT,
                 added_by INTEGER,
                 added_at TEXT
+            )
+            """
+        )
+        # broadcast tables for idempotent broadcasts
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broadcast_runs (
+                run_id TEXT PRIMARY KEY,
+                message_hash TEXT,
+                message TEXT,
+                created_by INTEGER,
+                created_at TEXT
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broadcast_recipients (
+                run_id TEXT,
+                user_id INTEGER,
+                status TEXT DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0,
+                last_attempt TEXT,
+                PRIMARY KEY (run_id, user_id)
             )
             """
         )
@@ -351,7 +375,7 @@ def _consume_token(block=True, timeout=10.0):
         time.sleep(0.01)
 
 
-# --- Robust tg_call implementation (unchanged) ---
+# --- Robust tg_call implementation ---
 _tele_429_count = 0
 
 
@@ -529,7 +553,7 @@ def set_webhook():
         return None
 
 
-# Task management functions (unchanged except uses of robust_send_message where needed)
+# Task management functions
 def enqueue_task(user_id: int, username: str, text: str) -> dict:
     words = split_text_into_words(text)
     total = len(words)
@@ -614,6 +638,61 @@ def get_messages_older_than(days=1):
         if sent_at < cutoff:
             res.append({"chat_id": r[0], "message_id": r[1]})
     return res
+
+
+# Broadcast helper DB functions for idempotency
+def compute_message_hash(text: str) -> str:
+    if text is None:
+        return ""
+    h = hashlib.sha256()
+    h.update(text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def create_broadcast_run(message: str, created_by: int) -> str:
+    run_id = str(uuid.uuid4())
+    message_hash = compute_message_hash(message)
+    db_execute(
+        "INSERT INTO broadcast_runs (run_id, message_hash, message, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+        (run_id, message_hash, message, created_by, get_now_iso()),
+    )
+    return run_id
+
+
+def insert_broadcast_recipient(run_id: str, user_id: int):
+    try:
+        db_execute(
+            "INSERT OR IGNORE INTO broadcast_recipients (run_id, user_id, status, attempts, last_attempt) VALUES (?, ?, 'pending', 0, ?)",
+            (run_id, user_id, get_now_iso()),
+        )
+    except Exception:
+        logger.exception("Failed to insert broadcast recipient %s for run %s", user_id, run_id)
+
+
+def get_previous_successful_recipients_for_message(message_hash: str):
+    rows = db_execute(
+        "SELECT DISTINCT br.user_id FROM broadcast_recipients br JOIN broadcast_runs r ON br.run_id = r.run_id WHERE r.message_hash = ? AND br.status = 'success'",
+        (message_hash,),
+        fetch=True,
+    )
+    return set(r[0] for r in rows) if rows else set()
+
+
+def get_pending_recipients_for_run(run_id: str):
+    rows = db_execute(
+        "SELECT user_id, status, attempts FROM broadcast_recipients WHERE run_id = ? AND status = 'pending' ORDER BY user_id ASC",
+        (run_id,),
+        fetch=True,
+    )
+    return rows or []
+
+
+def mark_broadcast_recipient_status(run_id: str, user_id: int, status: str, attempts: int = None):
+    now = get_now_iso()
+    if attempts is None:
+        db_execute("UPDATE broadcast_recipients SET status = ?, last_attempt = ? WHERE run_id = ? AND user_id = ?", (status, now, run_id, user_id))
+    else:
+        db_execute("UPDATE broadcast_recipients SET status = ?, attempts = ?, last_attempt = ? WHERE run_id = ? AND user_id = ?", (status, attempts, now, run_id, user_id))
 
 
 # Suspension helpers
@@ -759,7 +838,7 @@ def process_user_queue(user_id: int, chat_id: int, username: str):
     """
     Worker that processes queued tasks for a single user. Each word send is attempted via robust_send_message;
     only when a send is confirmed do we increment sent_count. On repeated failures for the same recipient we
-    pause/cancel the task and notify both the user and owners so manual intervention can occur.
+    pause/cancel the task and notify the user and owners so manual intervention can occur.
     """
     lock = get_user_lock(user_id)
     if not lock.acquire(blocking=False):
@@ -1368,28 +1447,69 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         if not args:
             robust_send_message(user_id, "ℹ️ Usage: /broadcast <message>")
             return jsonify({"ok": True})
+        message = args.strip()
+        if not message:
+            robust_send_message(user_id, "ℹ️ Empty broadcast message; nothing sent.")
+            return jsonify({"ok": True})
+
+        # Compute message hash and create run
+        message_hash = compute_message_hash(message)
+        run_id = create_broadcast_run(message, user_id)
+
+        # Find recipients who already received this exact message (cross-run idempotency)
+        already_done = get_previous_successful_recipients_for_message(message_hash)
+
         rows = db_execute("SELECT user_id FROM allowed_users", fetch=True) or []
-        count = 0
-        fails = []
-        # For each recipient attempt up to BROADCAST_MAX_ATTEMPTS; successful recipients won't be retried.
+        total_recipients = 0
         for r in rows:
             target = r[0]
-            try:
-                res = robust_send_message(target, f"📣 Broadcast from owner:\n\n{args}", attempts=BROADCAST_MAX_ATTEMPTS)
+            total_recipients += 1
+            if target in already_done:
+                # record as success for this run too
+                db_execute("INSERT OR IGNORE INTO broadcast_recipients (run_id, user_id, status, attempts, last_attempt) VALUES (?, ?, 'success', 0, ?)",
+                           (run_id, target, get_now_iso()))
+                continue
+            insert_broadcast_recipient(run_id, target)
+
+        # Process pending recipients for this run only
+        pending = get_pending_recipients_for_run(run_id)
+        success_count = 0
+        failed_list = []
+
+        for row in pending:
+            target = row[0]
+            attempts = int(row[2] or 0) if len(row) > 2 else 0
+            sent_ok = False
+            for attempt_no in range(attempts + 1, BROADCAST_MAX_ATTEMPTS + 1):
+                res = robust_send_message(target, f"📣 Broadcast from owner:\n\n{message}", attempts=1)
+                attempts = attempt_no
+                db_execute("UPDATE broadcast_recipients SET attempts = ?, last_attempt = ? WHERE run_id = ? AND user_id = ?",
+                           (attempts, get_now_iso(), run_id, target))
                 if res:
-                    count += 1
+                    sent_ok = True
+                    success_count += 1
+                    mark_broadcast_recipient_status(run_id, target, "success", attempts)
+                    break
                 else:
-                    fails.append(target)
-            except Exception:
-                logger.exception("Broadcast failed for %s", target)
-                fails.append(target)
-        robust_send_message(user_id, f"📣 Broadcast done. Success: {count}, Failed: {len(fails)}")
-        if fails:
-            # give an explicit list of failed recipients (may be large)
+                    if attempt_no < BROADCAST_MAX_ATTEMPTS:
+                        backoff = ROBUST_SEND_BASE_BACKOFF * (2 ** (attempt_no - 1))
+                        backoff = min(backoff, TG_CALL_MAX_BACKOFF)
+                        time.sleep(backoff + (0.05 * attempt_no))
+                    else:
+                        mark_broadcast_recipient_status(run_id, target, "failed", attempts)
+                        failed_list.append(target)
+
+        pre_skipped = len(already_done)
+        total_success = success_count + pre_skipped
+
+        robust_send_message(user_id, f"📣 Broadcast run {run_id} completed. Total recipients: {total_recipients}. Success: {total_success}. Failed: {len(failed_list)}")
+
+        if failed_list:
             try:
-                send_to_owners(f"⚠️ Broadcast had failures for recipients: {', '.join(str(x) for x in fails)}")
+                send_to_owners(f"⚠️ Broadcast run {run_id} had failures for recipients: {', '.join(str(x) for x in failed_list)}")
             except Exception:
                 logger.exception("Failed to notify owners about broadcast failures")
+
         return jsonify({"ok": True})
 
     send_message(user_id, "❓ Unknown command.")
