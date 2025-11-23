@@ -649,13 +649,19 @@ def health():
 def handle_command(user_id: int, username: str, command: str, args: str):
     # /start allowed for anyone
     if command == "/start":
-        send_message(user_id,
-                     f"Hi {username or user_id}! I split texts into single-word messages.\nSend any text to begin.")
+        msg = (
+            f"👋 Hello {username or user_id}!\n\n"
+            "I am WordSplitter Bot — I can split any text you send into single-word messages, "
+            "making it easier to read or process.\n\n"
+            "Just send me a message, and I'll start splitting it word by word.\n"
+            "You can also try /example to see a demo."
+        )
+        send_message(user_id, msg)
         return jsonify({"ok": True})
 
     # require allowed for other commands
     if not is_allowed(user_id):
-        send_message(user_id, "You are not allowed to use this bot. Owner has been notified.")
+        send_message(user_id, "❌ You are not allowed to use this bot. Owner has been notified.")
         notify_owners(f"Unallowed access attempt by {username or user_id} ({user_id}).")
         return jsonify({"ok": True})
 
@@ -741,7 +747,14 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         return jsonify({"ok": True})
 
     if command == "/about":
-        send_message(user_id, f"WordSplitter — splits your text one word at a time. Owners: {', '.join(str(x) for x in OWNER_IDS)}")
+        msg = (
+            "🤖 WordSplitter Bot\n\n"
+            "I take any text you send and split it into individual word messages, "
+            "with controlled pacing so you can follow easily.\n\n"
+            "Useful for breaking down long messages for readability or analysis.\n\n"
+            "Admins can manage allowed users, suspend or resume users, and owners can broadcast messages."
+        )
+        send_message(user_id, msg)
         return jsonify({"ok": True})
 
     # Admin commands
@@ -871,50 +884,56 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     # Suspend / Unsuspend / Listsuspended
     if command == "/suspend":
         if not is_admin(user_id):
-            send_message(user_id, "Admin only.")
+            send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /suspend <user_id> <duration> [reason]\nExamples:\n/suspend 12345678 30s Spam\n/suspend 9876543 5m Too many messages")
+            send_message(user_id,
+                         "Usage: /suspend <user_id> <duration> [reason]\n"
+                         "Examples:\n"
+                         "/suspend 12345678 30s Spam\n"
+                         "/suspend 9876543 5m Too many messages")
             return jsonify({"ok": True})
         parts = args.split(None, 2)
         try:
             target = int(parts[0])
         except Exception:
-            send_message(user_id, "Invalid user id. Example: /suspend 12345678 5m Spamming")
+            send_message(user_id, "❌ Invalid user id.\nExample: /suspend 12345678 5m Spamming")
             return jsonify({"ok": True})
         if len(parts) < 2:
-            send_message(user_id, "Missing duration. Example: /suspend 12345678 5m Spamming")
+            send_message(user_id, "❌ Missing duration.\nExample: /suspend 12345678 5m Spamming")
             return jsonify({"ok": True})
         dur = parts[1]
         reason = parts[2] if len(parts) > 2 else ""
         m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
         if not m:
-            send_message(user_id, "Invalid duration. Use 30s, 5m, 3h, 2d. Example: /suspend 12345678 5m")
+            send_message(user_id, "❌ Invalid duration format.\nUse 30s, 5m, 3h, 2d.\nExample: /suspend 12345678 5m")
             return jsonify({"ok": True})
         val, unit = int(m.group(1)), (m.group(2) or "s")
         mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
         seconds = val * mul
         suspend_user(target, seconds, reason)
-        send_message(user_id, f"Suspended {target} for {val}{unit}.")
+        send_message(user_id, f"✅ Suspended {target} for {val}{unit}.")
         return jsonify({"ok": True})
 
     if command == "/unsuspend":
         if not is_admin(user_id):
-            send_message(user_id, "Admin only.")
+            send_message(user_id, "❌ Admin only.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /unsuspend <user_id>\nExample: /unsuspend 12345678")
+            send_message(user_id,
+                         "Usage: /unsuspend <user_id>\n"
+                         "Example: /unsuspend 12345678")
             return jsonify({"ok": True})
         try:
             target = int(args.split()[0])
         except Exception:
-            send_message(user_id, "Invalid user id. Example: /unsuspend 12345678")
+            send_message(user_id, "❌ Invalid user id.\nExample: /unsuspend 12345678")
             return jsonify({"ok": True})
         ok = unsuspend_user(target)
         if ok:
-            send_message(user_id, f"Unsuspended {target}.")
+            send_message(user_id, f"✅ Unsuspended {target}.")
         else:
-            send_message(user_id, f"User {target} was not suspended.")
+            send_message(user_id, f"ℹ️ User {target} was not suspended.")
         return jsonify({"ok": True})
 
     if command == "/listsuspended":
