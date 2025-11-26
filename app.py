@@ -12,6 +12,7 @@ This version:
   terminated due to maintenance and will not run after maintenance.
 - Keeps DB parent creation and in-memory fallback, token bucket tuned for low CPU, defensive DB handling.
 - Removed psutil and /mem,/sysmem endpoints as requested.
+- Fix: prevent duplicate per-user workers by reserving a user before submitting a worker.
 """
 
 import os
@@ -403,7 +404,7 @@ def start_maintenance():
     with _maintenance_lock:
         _is_maintenance = True
     stopped = cancel_all_tasks()
-    msg = f"⚠️ Maintenance Started! 🛠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tasks. All tasks submitted during maintenance are terminated and will not run after maintenance. Please try again after 4:00 AM WAT."
+    msg = f"⚠️ Maintenance Started! 🛠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tas[...]
     broadcast_to_all_allowed(msg)
     logger.info("Maintenance started. All tasks cancelled: %s", stopped)
 
@@ -578,29 +579,58 @@ def is_suspended(user_id: int) -> bool:
 # Executor and active-users tracking
 executor = ThreadPoolExecutor(max_workers=max(1, MAX_CONCURRENT_USERS))
 _active_users: Set[int] = set()
+_reserved_users: Set[int] = set()
 _active_users_lock = threading.Lock()
 
 def mark_user_active(uid: int):
     with _active_users_lock:
         _active_users.add(uid)
+        # ensure reservation cleared if present
+        _reserved_users.discard(uid)
 
 def unmark_user_active(uid: int):
     with _active_users_lock:
         _active_users.discard(uid)
+        _reserved_users.discard(uid)
 
 def is_user_active(uid: int) -> bool:
     with _active_users_lock:
         return uid in _active_users
+
+def reserve_user_for_submission(uid: int) -> bool:
+    """
+    Atomically reserve a user id for submission to executor.
+    This prevents multiple concurrent submissions for the same user
+    (race between request handler and dispatcher).
+    Returns True if reservation succeeded, False if user already active/reserved.
+    """
+    with _active_users_lock:
+        if uid in _active_users or uid in _reserved_users:
+            return False
+        _reserved_users.add(uid)
+        return True
+
+def unreserve_user(uid: int):
+    with _active_users_lock:
+        _reserved_users.discard(uid)
 
 # Worker logic: per-user sequential processing, but limited concurrent users by executor
 def process_user_queue(user_id: int):
     """
     Runs in executor thread for a single user; processes that user's queued tasks sequentially.
     Ensures only one executor thread handles a given user at a time.
+    Note: we use reservation to avoid duplicate worker submissions. At thread start
+    we convert any reservation to active atomically.
     """
-    if is_user_active(user_id):
-        return
-    mark_user_active(user_id)
+    # Convert reservation to active (or just mark active if not reserved but safe)
+    with _active_users_lock:
+        # if another thread already marked active, exit
+        if user_id in _active_users:
+            return
+        # clear reservation if present and mark active
+        _reserved_users.discard(user_id)
+        _active_users.add(user_id)
+
     try:
         # If suspended, cancel queued tasks for that user
         if is_suspended(user_id):
@@ -744,19 +774,20 @@ def dispatcher_loop():
                 if is_suspended(uid):
                     cancel_active_task_for_user(uid)
                     continue
-                if is_user_active(uid):
-                    continue
-                # if executor has capacity (we rely on ThreadPoolExecutor to queue tasks,
-                # but we avoid flooding active_users beyond max concurrency)
                 with _active_users_lock:
                     if len(_active_users) >= MAX_CONCURRENT_USERS:
                         break
+                # Reserve before submitting to avoid races with request-time submits
+                if not reserve_user_for_submission(uid):
+                    continue
                 try:
                     executor.submit(process_user_queue, uid)
                     # small yield
                     time.sleep(0.02)
                 except Exception:
                     logger.exception("Failed to submit user worker for %s", uid)
+                    # unreserve so future attempts can submit
+                    unreserve_user(uid)
             time.sleep(idle_sleep)
         except Exception:
             logger.exception("Dispatcher error")
@@ -909,6 +940,14 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, "😔 Could not queue demo. Try later.")
             return jsonify({"ok": True})
         send_message(user_id, f"Demo queued — will split *{res['total_words']}* words. ✨")
+        # attempt to reserve and submit a worker if not active
+        if not is_user_active(user_id):
+            if reserve_user_for_submission(user_id):
+                try:
+                    executor.submit(process_user_queue, user_id)
+                except Exception:
+                    logger.exception("Failed to submit task worker for user %s", user_id)
+                    unreserve_user(user_id)
         return jsonify({"ok": True})
 
     if command == "/pause":
@@ -1222,12 +1261,14 @@ def handle_user_text(user_id: int, username: str, text: str):
             return jsonify({"ok": True})
         send_message(user_id, "😔 Could not queue task. Try later.")
         return jsonify({"ok": True})
-    # submit per-user worker if not already active
+    # submit per-user worker if not already active - reserve first to avoid races
     if not is_user_active(user_id):
-        try:
-            executor.submit(process_user_queue, user_id)
-        except Exception:
-            logger.exception("Failed to submit task worker for user %s", user_id)
+        if reserve_user_for_submission(user_id):
+            try:
+                executor.submit(process_user_queue, user_id)
+            except Exception:
+                logger.exception("Failed to submit task worker for user %s", user_id)
+                unreserve_user(user_id)
     # report queue position/count
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
