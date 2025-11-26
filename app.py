@@ -403,7 +403,12 @@ def start_maintenance():
     with _maintenance_lock:
         _is_maintenance = True
     stopped = cancel_all_tasks()
-    msg = f"⚠️ Maintenance Started! 🛠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tas[...]
+    msg = (
+        f"⚠️ Maintenance Started! 🛠️\n\n"
+        "The WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\n"
+        f"We *stopped* {stopped} pending tasks. All queued and running tasks have been cancelled and will not resume.\n\n"
+        "Please try again after the maintenance window. Thank you for your patience! 🙏"
+    )
     broadcast_to_all_allowed(msg)
     logger.info("Maintenance started. All tasks cancelled: %s", stopped)
 
