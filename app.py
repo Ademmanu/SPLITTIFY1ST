@@ -404,7 +404,13 @@ def start_maintenance():
     with _maintenance_lock:
         _is_maintenance = True
     stopped = cancel_all_tasks()
-    msg = f"⚠️ Maintenance Started! 🛠️\n\nThe WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\nWe *stopped* {stopped} pending tas[...]
+    # Fixed maintenance message (previous truncated f-string caused SyntaxError)
+    msg = (
+        f"⚠️ Maintenance Started! 🛠️\n\n"
+        "The WordSplitter bot is undergoing scheduled maintenance and will be unavailable from *3:00 AM to 4:00 AM WAT*.\n\n"
+        f"We stopped {stopped} pending/running tasks to ensure a clean maintenance window. New tasks submitted during this time will be rejected and won't be resumed automatically.\n\n"
+        "We expect to be back online at 4:00 AM WAT. Sorry for the interruption and thank you for your patience!"
+    )
     broadcast_to_all_allowed(msg)
     logger.info("Maintenance started. All tasks cancelled: %s", stopped)
 
