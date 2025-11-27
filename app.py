@@ -587,17 +587,23 @@ def is_allowed(user_id: int) -> bool:
 def suspend_user(target_id: int, seconds: int, reason: str = ""):
     until_utc_str = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
     until_wat_str = utc_to_wat_ts(until_utc_str)
-    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO suspended_users (user_id, suspended_until, reason, added_at) VALUES (?, ?, ?, ?)",
-                  (target_id, until_utc_str, reason, now_ts()))
-        conn.commit()
+    try:
+        with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO suspended_users (user_id, suspended_until, reason, added_at) VALUES (?, ?, ?, ?)",
+                      (target_id, until_utc_str, reason, now_ts()))
+            conn.commit()
+    except Exception:
+        logger.exception("suspend_user db error")
     stopped = cancel_active_task_for_user(target_id)
     try:
-        send_message(target_id, f"⛔ You have been suspended until {until_wat_str} by {OWNER_TAG}.")
+        # Notify the suspended user; include reason if provided
+        reason_text = f"\nReason: {reason}" if reason else ""
+        send_message(target_id, f"⛔ You have been suspended until {until_wat_str} by {OWNER_TAG}.{reason_text}")
     except Exception:
         logger.exception("notify suspended user failed")
-    notify_owners(f"🔒 User suspended: {label_for_owner_view(target_id, fetch_display_username(target_id))} suspended_until={until_wat_str} by {OWNER_TAG}")
+    # Notify owners, include reason for context
+    notify_owners(f"🔒 User suspended: {label_for_owner_view(target_id, fetch_display_username(target_id))} suspended_until={until_wat_str} by {OWNER_TAG} reason={reason}")
 
 def unsuspend_user(target_id: int) -> bool:
     with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -1259,14 +1265,17 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             notify_owners("⚠️ Broadcast failures: " + ", ".join(f"{x[0]}({x[1]})" for x in failed))
         return jsonify({"ok": True})
 
+    # Replace the existing suspend parsing block in handle_command(...):
     if command == "/suspend":
         if not is_owner(user_id):
             send_message(user_id, f"🔒 {OWNER_TAG} only.")
             return jsonify({"ok": True})
         if not args:
-            send_message(user_id, "Usage: /suspend <telegram_user_id> [duration]")
+            send_message(user_id, "Usage: /suspend <telegram_user_id> <duration> [reason]\nExample: /suspend 8282747479 30s Too many requests")
             return jsonify({"ok": True})
-        parts = args.split(None, 2)
+        # Accept: /suspend <id> <duration> [reason...]
+        parts = args.split()
+        # Validate id
         try:
             target = int(parts[0])
         except Exception:
@@ -1276,16 +1285,17 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             send_message(user_id, "Missing duration.")
             return jsonify({"ok": True})
         dur = parts[1]
-        reason = parts[2] if len(parts) > 2 else ""
+        reason = " ".join(parts[2:]) if len(parts) > 2 else ""
         m = re.match(r"^(\d+)(s|m|h|d)?$", dur)
         if not m:
-            send_message(user_id, "Invalid duration format.")
+            send_message(user_id, "Invalid duration format. Examples: 30s 10m 2h 1d")
             return jsonify({"ok": True})
         val, unit = int(m.group(1)), (m.group(2) or "s")
         mul = {"s":1, "m":60, "h":3600, "d":86400}.get(unit,1)
         seconds = val * mul
         suspend_user(target, seconds, reason)
-        send_message(user_id, f"🔒 User {label_for_owner_view(target, fetch_display_username(target))} suspended until {utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))}.")
+        reason_part = f" Reason: {reason}" if reason else ""
+        send_message(user_id, f"🔒 User {label_for_owner_view(target, fetch_display_username(target))} suspended until {utc_to_wat_ts((datetime.utcnow() + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S'))}.{reason_part}")
         return jsonify({"ok": True})
 
     if command == "/unsuspend":
