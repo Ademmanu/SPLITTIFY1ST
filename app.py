@@ -1006,16 +1006,19 @@ def webhook():
             username = user.get("username") or (user.get("first_name") or "")
             text = msg.get("text") or ""
 
-            # Ensure an allowed_users row exists for this user (insert if missing), then update username
+            # --- FIX APPLIED HERE ---
+            # Ensure we only update username for existing/allowed users.
+            # We explicitly REMOVED the INSERT OR IGNORE to prevent unallowed users
+            # from being automatically added to the allowed_users table upon first contact.
             try:
                 with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                     c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO allowed_users (user_id, username, added_at) VALUES (?, ?, ?)",
-                              (uid, username or "", now_ts()))
+                    # Only update the username; if the user_id is not already present, nothing happens.
                     c.execute("UPDATE allowed_users SET username = ? WHERE user_id = ?", (username or "", uid))
                     conn.commit()
             except Exception:
-                logger.exception("webhook: ensure allowed_users row failed")
+                logger.exception("webhook: update allowed_users username failed")
+            # --- END OF FIX ---
 
             if text.startswith("/"):
                 parts = text.split(None, 1)
