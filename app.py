@@ -12,15 +12,10 @@ Features:
 - Rate-limited sending.
 
 Notes on this revision:
-- Removed all message text styling (no parse_mode is sent).
-- Adds "mention" entities for @usernames so they become clickable in Telegram.
-- Marks numeric IDs as "code" entities so they're copyable (monospace).
-- Ensures entities do not overlap.
-- Removed display of task IDs everywhere in user-facing messages.
-- Usernames are displayed with an "@" prefix everywhere they are shown.
-- Owner references now include "(@justmemmy)".
-- Unauthorized user notifications to the user include their numeric ID (and it will be sent as code so it is copyable).
-- Replies and notifications have emoji for clarity.
+- Removed clickable @username mentions: usernames are shown without "@" and not emitted as mention entities.
+- Numeric IDs are emitted as "code" entities (monospace) so they are copyable.
+- Owner tag (Owner (@justmemmy)) is left unchanged.
+- Message entity offsets/lengths use UTF-16 code units as required by Telegram.
 """
 
 import os
@@ -84,9 +79,13 @@ def utc_to_wat_ts(utc_ts: str) -> str:
 
 # Helper formatting functions added per request
 def at_username(u: str) -> str:
+    """
+    Return username WITHOUT the leading '@'. Usernames are displayed plain
+    (no @ prefix) and are NOT clickable (no mention entities).
+    """
     if not u:
         return ""
-    return u if u.startswith("@") else "@" + u
+    return u.lstrip("@")
 
 def label_for_self(viewer_id: int, username: str) -> str:
     """
@@ -101,7 +100,7 @@ def label_for_self(viewer_id: int, username: str) -> str:
 
 def label_for_owner_view(target_id: int, target_username: str) -> str:
     """
-    When showing a user in owner-facing messages, include @username if available,
+    When showing a user in owner-facing messages, include username (no '@') if available,
     otherwise show numeric id. Always include numeric id for clarity to owners.
     """
     if target_username:
@@ -109,6 +108,7 @@ def label_for_owner_view(target_id: int, target_username: str) -> str:
     return str(target_id)
 
 # Replace plain "Owner" mentions with Owner (@justmemmy) in messages.
+# NOTE: per request, OWNER_TAG is left unchanged.
 OWNER_TAG = "Owner (@justmemmy)"
 
 _is_maintenance = False
@@ -309,53 +309,49 @@ def parse_telegram_json(resp):
     except Exception:
         return None
 
+def _utf16_len(s: str) -> int:
+    """
+    Return length in UTF-16 code units for a Python string.
+    Telegram requires offsets/lengths in UTF-16 code units.
+    We use utf-16-le encoding and divide bytes by 2 to get code units.
+    """
+    if not s:
+        return 0
+    return len(s.encode("utf-16-le")) // 2
+
 def _build_entities_for_text(text: str):
     """
     Build a list of Telegram message entities for:
-    - @username tokens -> type "mention" (clickable username links)
     - plain numeric tokens -> type "code" (monospace, copyable)
-    We avoid overlapping spans.
-    Offsets/lengths use UTF-16 code units; for ASCII characters this matches Python indices.
+
+    Note: clickable @username mentions have been removed per request.
+    Offsets/lengths are computed using UTF-16 code units.
     """
     if not text:
         return None
     entities = []
-    used_spans = []
-
-    # Find @username mentions (ASCII, 1..32 chars: letters, numbers, underscore)
-    for m in re.finditer(r"@([A-Za-z0-9_]{1,32})", text):
-        start = m.start()
-        length = m.end() - m.start()
-        entities.append({"type": "mention", "offset": start, "length": length})
-        used_spans.append((start, start + length))
-
-    # Find numeric tokens that do not overlap existing mention spans
+    # Find numeric tokens and mark as code (UTF-16 offsets)
     for m in re.finditer(r"\b\d+\b", text):
-        start = m.start()
-        end = m.end()
-        # check overlap
-        overlap = False
-        for s, e in used_spans:
-            if not (end <= s or start >= e):
-                overlap = True
-                break
-        if overlap:
-            continue
-        length = end - start
-        entities.append({"type": "code", "offset": start, "length": length})
-        used_spans.append((start, end))
-
+        py_start = m.start()
+        py_end = m.end()
+        utf16_offset = _utf16_len(text[:py_start])
+        utf16_length = _utf16_len(text[py_start:py_end])
+        entities.append({"type": "code", "offset": utf16_offset, "length": utf16_length})
     return entities if entities else None
 
 def _build_code_entities_for_numbers(text: str):
     """
-    Legacy helper: mark numeric tokens as code. Kept for backward compatibility.
+    Legacy helper: mark numeric tokens as code. Uses UTF-16 offsets.
     """
+    if not text:
+        return None
     entities = []
     for m in re.finditer(r"\b\d+\b", text):
-        start = m.start()
-        length = m.end() - m.start()
-        entities.append({"type": "code", "offset": start, "length": length})
+        py_start = m.start()
+        py_end = m.end()
+        utf16_offset = _utf16_len(text[:py_start])
+        utf16_length = _utf16_len(text[py_start:py_end])
+        entities.append({"type": "code", "offset": utf16_offset, "length": utf16_length})
     return entities if entities else None
 
 def increment_failure(user_id: int):
@@ -405,8 +401,9 @@ def reset_failures(user_id: int):
 
 def send_message(chat_id: int, text: str):
     """
-    Send plain text (no parse_mode). @usernames will be marked 'mention' (clickable),
-    numeric IDs will be marked 'code' (monospace) so they are copyable.
+    Send plain text (no parse_mode). Numeric IDs inside the text are sent
+    as monospace (code) via the 'entities' parameter so they are copyable.
+    Usernames are plain text without leading '@' and not clickable.
     """
     if not TELEGRAM_API:
         logger.error("No TELEGRAM_TOKEN; cannot send message.")
@@ -441,7 +438,7 @@ def send_message(chat_id: int, text: str):
 
 def broadcast_send_raw(chat_id: int, text: str):
     """
-    Send a plain broadcast message; numeric IDs and @usernames will be marked via entities.
+    Send a plain broadcast message; numeric IDs will be marked as code entities.
     """
     if not TELEGRAM_API:
         return False, "no_token"
