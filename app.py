@@ -5,17 +5,16 @@ Features:
 - Owner-only privileged commands.
 - Per-user worker threads and queued word splitting.
 - Max queue: 5 per user.
-- Scheduled daily maintenance Nigeria time (2:00 AM–3:00 AM WAT).
+- Scheduled daily maintenance Nigeria time (2:00 AM–3:01 AM WAT).
 - ALLOWED_USERS env and owners auto-added; /start works for all allowed.
 - Accurate stats: all words sent, even for cancelled/stopped tasks.
 - Usernames saved each time a word is sent for stats/reporting.
 - Rate-limited sending.
 
 Notes on this revision:
-- Removed clickable @username mentions: usernames are shown without "@" and not emitted as mention entities.
-- Numeric IDs are emitted as "code" entities (monospace) so they are copyable.
-- Owner tag (Owner (@justmemmy)) is left unchanged.
-- Message entity offsets/lengths use UTF-16 code units as required by Telegram.
+- FIX: Adjusted maintenance scheduler to 1:00 AM UTC (start) and 2:01 AM UTC (end) for 2:00 AM - 3:01 AM WAT window.
+- FIX: Added robust worker loop checks to force sleep/cancellation immediately upon maintenance start.
+- FIX: Implemented a FINAL check inside the worker's tight sending loop to ensure instant break on maintenance flag detection.
 
 Optimization note: The per_user_worker_loop has been optimized to use time.monotonic() for precise interval timing and reduced DB lookups within the main sending loop for tighter delay alignment and better efficiency.
 """
@@ -110,7 +109,6 @@ def label_for_owner_view(target_id: int, target_username: str) -> str:
     return str(target_id)
 
 # Replace plain "Owner" mentions with Owner (@justmemmy) in messages.
-# NOTE: per request, OWNER_TAG is left unchanged.
 OWNER_TAG = "Owner (@justmemmy)"
 
 _is_maintenance = False
@@ -411,6 +409,12 @@ def send_message(chat_id: int, text: str):
         logger.error("No TELEGRAM_TOKEN; cannot send message.")
         return None
     acquire_token(timeout=5.0)
+    
+    # CRITICAL CHECK POINT 4: Maintenance check immediately before external API call
+    if is_maintenance_time():
+        logger.info("Attempted to send message during maintenance to %s. Aborting.", chat_id)
+        return None # Abort send if maintenance starts while waiting for token
+
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     entities = _build_entities_for_text(text)
     if entities:
@@ -481,7 +485,7 @@ def broadcast_to_all_allowed(text: str):
             broadcast_send_raw(tid, text)
 
 def cancel_all_tasks():
-    with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+    with _db_lock, sqliteite3.connect(DB_PATH, timeout=30) as conn:
         c = conn.cursor()
         c.execute("UPDATE tasks SET status = ?, finished_at = ? WHERE status IN ('queued','running','paused')", ("cancelled", now_ts()))
         conn.commit()
@@ -490,10 +494,15 @@ def cancel_all_tasks():
 
 def start_maintenance():
     global _is_maintenance
+    # Lock flag FIRST
     with _maintenance_lock:
         _is_maintenance = True
-    stopped = cancel_all_tasks()
-    broadcast_to_all_allowed("🛠️ Scheduled maintenance started (2:00 AM–3:00 AM WAT). Tasks are temporarily blocked. Please try later.")
+    
+    # Then cancel all tasks (Hard Termination)
+    stopped = cancel_all_tasks() 
+    
+    # Then notify
+    broadcast_to_all_allowed("🛠️ Scheduled maintenance started (2:00 AM–3:01 AM WAT). Tasks are temporarily blocked. Please try later.")
     notify_owners(f"🔧 Automatic maintenance started. Bot tasks were blocked by {OWNER_TAG}.")
     logger.info("Maintenance started. All tasks cancelled: %s", stopped)
 
@@ -509,6 +518,7 @@ def split_text_to_words(text: str) -> List[str]:
     return [w for w in text.strip().split() if w]
 
 def enqueue_task(user_id: int, username: str, text: str):
+    # CRITICAL CHECK POINT 1: Block new tasks at the entry
     if is_maintenance_time():
         return {"ok": False, "reason": "maintenance"}
     words = split_text_to_words(text)
@@ -698,15 +708,15 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
     logger.info("Worker loop starting for user %s", user_id)
     try:
         # Cache uname for stat and log outside the main loop
-        # This reduces redundant database lookups inside the tight sending loop.
         uname_for_stat = fetch_display_username(user_id) or str(user_id)
 
         while not stop_event.is_set():
-            # --- Check Maintenance and Suspension ---
+            # --- Check Maintenance and Suspension (The Gatekeeper) ---
             if is_maintenance_time():
                 # Block until maintenance ends or worker is stopped
                 cancel_active_task_for_user(user_id)
-                # **FIXED**: Wait until maintenance is truly over.
+                
+                # Worker is forced to wait until maintenance is truly over.
                 while is_maintenance_time() and not stop_event.is_set():
                     wake_event.wait(timeout=3.0)
                     wake_event.clear()
@@ -834,8 +844,19 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                     else:
                         break # Must have been cancelled/stop_event set inside the pause loop
 
-                # --- Send Word and Log ---
+                # --- Send Word and Log (The Final Veto Check) ---
                 try:
+                    # CRITICAL CHECK POINT 5: Immediate break just before sending (Final Veto)
+                    if is_maintenance_time() or is_suspended(user_id):
+                        if is_maintenance_time():
+                            # Ensure status is set correctly before breaking the loop
+                            set_task_status(task_id, "cancelled") 
+                            try: 
+                                send_message(user_id, f"🛠️ Your task stopped due to scheduled maintenance.")
+                            except Exception: 
+                                pass
+                        break
+                        
                     send_message(user_id, words[i])
                     # Use cached uname_for_stat for log consistency and speed
                     record_split_log(user_id, uname_for_stat, 1) 
@@ -855,8 +876,6 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                     logger.exception("Failed to update sent_count for task %s", task_id)
 
                 # --- Dynamic Delay (Tight Alignment) ---
-                # Calculate time to sleep to hit the target interval precisely using monotonic clock
-                
                 # Check for immediate interrupt (wake signal) right after the DB update
                 if wake_event.is_set():
                     wake_event.clear()
@@ -894,7 +913,9 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                     pass
             elif final_status == "cancelled":
                 try:
-                    send_message(user_id, f"🛑 Task stopped.")
+                    # Only send "Task stopped" if the user hasn't already received the "Maintenance stopped" message
+                    if not is_maintenance_time():
+                        send_message(user_id, f"🛑 Task stopped.")
                 except Exception:
                     pass
             # Status remains 'paused' if it was paused
@@ -985,7 +1006,7 @@ def check_and_lift():
         except Exception:
             logger.exception("suspend parse error for %s", r)
 
-# --- FIX 1: Adjusted Maintenance Scheduler Times ---
+# --- Scheduler Configuration ---
 # Nigeria time: 2:00 AM WAT = 1:00 AM UTC
 # Nigeria time: 3:01 AM WAT = 2:01 AM UTC (Ensures full stop)
 scheduler = BackgroundScheduler()
@@ -1070,13 +1091,14 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             "ℹ️ About:\n"
             "I split texts into single words. ✂️\n\n"
             "Features:\n"
-            "queueing, pause/resume, scheduled maintenance (2:00 AM–3:00 AM WAT),\n"
+            "queueing, pause/resume, scheduled maintenance (2:00 AM–3:01 AM WAT),\n"
             "hourly owner stats, rate-limited sending. ⚖️"
         )
         send_message(user_id, msg)
         return jsonify({"ok": True})
 
-    if command != "/start" and is_maintenance_time() and not is_owner(user_id):
+    # CRITICAL CHECK POINT 2: Block command execution during maintenance
+    if command != "/start" and command != "/about" and is_maintenance_time() and not is_owner(user_id):
         send_message(user_id, "🛠️ Scheduled maintenance in progress. Tasks are temporarily blocked. Please try later.")
         return jsonify({"ok": True})
 
@@ -1326,7 +1348,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             notify_owners("⚠️ Broadcast failures: " + ", ".join(f"{x[0]}({x[1]})" for x in failed))
         return jsonify({"ok": True})
 
-    # Replace the existing suspend parsing block in handle_command(...):
     if command == "/suspend":
         if not is_owner(user_id):
             send_message(user_id, f"🔒 {OWNER_TAG} only.")
@@ -1382,6 +1403,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     return jsonify({"ok": True})
 
 def handle_user_text(user_id: int, username: str, text: str):
+    # CRITICAL CHECK POINT 3: Block general text input during maintenance
     if is_maintenance_time():
         send_message(user_id, "🛠️ Scheduled maintenance in progress. Tasks are temporarily blocked. Please try later.")
         return jsonify({"ok": True})
