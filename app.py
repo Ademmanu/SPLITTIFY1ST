@@ -5,7 +5,7 @@ Features:
 - Owner-only privileged commands.
 - Per-user worker threads and queued word splitting.
 - Max queue: 5 per user.
-- Scheduled daily maintenance Nigeria time (2–3 AM WAT).
+- Scheduled daily maintenance Nigeria time (2:00 AM–3:00 AM WAT).
 - ALLOWED_USERS env and owners auto-added; /start works for all allowed.
 - Accurate stats: all words sent, even for cancelled/stopped tasks.
 - Usernames saved each time a word is sent for stats/reporting.
@@ -702,10 +702,11 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
         uname_for_stat = fetch_display_username(user_id) or str(user_id)
 
         while not stop_event.is_set():
-            # Initial checks for maintenance/suspension are outside the tight loop
+            # --- Check Maintenance and Suspension ---
             if is_maintenance_time():
                 # Block until maintenance ends or worker is stopped
                 cancel_active_task_for_user(user_id)
+                # **FIXED**: Wait until maintenance is truly over.
                 while is_maintenance_time() and not stop_event.is_set():
                     wake_event.wait(timeout=3.0)
                     wake_event.clear()
@@ -984,12 +985,14 @@ def check_and_lift():
         except Exception:
             logger.exception("suspend parse error for %s", r)
 
-# Nigeria time: 2 AM = UTC 1; 3 AM = UTC 2
+# --- FIX 1: Adjusted Maintenance Scheduler Times ---
+# Nigeria time: 2:00 AM WAT = 1:00 AM UTC
+# Nigeria time: 3:01 AM WAT = 2:01 AM UTC (Ensures full stop)
 scheduler = BackgroundScheduler()
 scheduler.add_job(send_hourly_owner_stats, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=10), timezone='UTC')
 scheduler.add_job(check_and_lift, "interval", minutes=1, next_run_time=datetime.utcnow() + timedelta(seconds=15), timezone='UTC')
-scheduler.add_job(start_maintenance, 'cron', hour=1, minute=0, timezone='UTC')
-scheduler.add_job(end_maintenance, 'cron', hour=2, minute=0, timezone='UTC')
+scheduler.add_job(start_maintenance, 'cron', hour=1, minute=0, timezone='UTC') # 1:00 AM UTC (2:00 AM WAT)
+scheduler.add_job(end_maintenance, 'cron', hour=2, minute=1, timezone='UTC')   # 2:01 AM UTC (3:01 AM WAT)
 scheduler.start()
 
 @app.route("/webhook", methods=["POST"])
@@ -1006,10 +1009,7 @@ def webhook():
             username = user.get("username") or (user.get("first_name") or "")
             text = msg.get("text") or ""
 
-            # --- FIX APPLIED HERE ---
             # Ensure we only update username for existing/allowed users.
-            # We explicitly REMOVED the INSERT OR IGNORE to prevent unallowed users
-            # from being automatically added to the allowed_users table upon first contact.
             try:
                 with _db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
                     c = conn.cursor()
@@ -1018,7 +1018,6 @@ def webhook():
                     conn.commit()
             except Exception:
                 logger.exception("webhook: update allowed_users username failed")
-            # --- END OF FIX ---
 
             if text.startswith("/"):
                 parts = text.split(None, 1)
@@ -1071,7 +1070,7 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             "ℹ️ About:\n"
             "I split texts into single words. ✂️\n\n"
             "Features:\n"
-            "queueing, pause/resume, scheduled maintenance (2AM–3AM),\n"
+            "queueing, pause/resume, scheduled maintenance (2:00 AM–3:00 AM WAT),\n"
             "hourly owner stats, rate-limited sending. ⚖️"
         )
         send_message(user_id, msg)
