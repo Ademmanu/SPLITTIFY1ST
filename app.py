@@ -719,7 +719,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
             set_task_status(task_id, "running")
 
             # --- Calculate Dynamic Interval ---
-            interval = 0.4 if total <= 150 else (0.5 if total <= 300 else 0.6)
+            interval = 0.5 if total <= 150 else (0.6 if total <= 300 else 0.7)
             est_seconds = int((total - sent) * interval)
             est_str = str(timedelta(seconds=est_seconds))
             
