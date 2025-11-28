@@ -5,7 +5,6 @@ Features:
 - Owner-only privileged commands.
 - Per-user worker threads and queued word splitting.
 - Max queue: 5 per user.
-- Scheduled daily maintenance Nigeria time (2–3 AM WAT).
 - ALLOWED_USERS env and owners auto-added; /start works for all allowed.
 - Accurate stats: all words sent, even for cancelled/stopped tasks.
 - Usernames saved each time a word is sent for stats/reporting.
@@ -16,6 +15,7 @@ Notes on this revision:
 - Numeric IDs are emitted as "code" entities (monospace) so they are copyable.
 - Owner tag (Owner (@justmemmy)) is left unchanged.
 - Message entity offsets/lengths use UTF-16 code units as required by Telegram.
+- Maintenance mode features have been removed.
 
 Optimization note: The per_user_worker_loop has been optimized to use time.monotonic() for precise interval timing and reduced DB lookups within the main sending loop for tighter delay alignment and better efficiency.
 """
@@ -112,12 +112,6 @@ def label_for_owner_view(target_id: int, target_username: str) -> str:
 # Replace plain "Owner" mentions with Owner (@justmemmy) in messages.
 # NOTE: per request, OWNER_TAG is left unchanged.
 OWNER_TAG = "Owner (@justmemmy)"
-
-_is_maintenance = False
-_maintenance_lock = threading.Lock()
-def is_maintenance_time() -> bool:
-    with _maintenance_lock:
-        return _is_maintenance
 
 _db_lock = threading.Lock()
 def _ensure_db_parent(dirpath: str):
@@ -488,29 +482,10 @@ def cancel_all_tasks():
         count = c.rowcount
     return count
 
-def start_maintenance():
-    global _is_maintenance
-    with _maintenance_lock:
-        _is_maintenance = True
-    stopped = cancel_all_tasks()
-    broadcast_to_all_allowed("🛠️ Scheduled maintenance started (2:00 AM–3:00 AM WAT). Tasks are temporarily blocked. Please try later.")
-    notify_owners(f"🔧 Automatic maintenance started. Bot tasks were blocked by {OWNER_TAG}.")
-    logger.info("Maintenance started. All tasks cancelled: %s", stopped)
-
-def end_maintenance():
-    global _is_maintenance
-    with _maintenance_lock:
-        _is_maintenance = False
-    broadcast_to_all_allowed("✅ Scheduled maintenance ended. Bot is now available for tasks.")
-    notify_owners(f"✅ Automatic maintenance ended. Bot resumed under {OWNER_TAG}.")
-    logger.info("Maintenance ended.")
-
 def split_text_to_words(text: str) -> List[str]:
     return [w for w in text.strip().split() if w]
 
 def enqueue_task(user_id: int, username: str, text: str):
-    if is_maintenance_time():
-        return {"ok": False, "reason": "maintenance"}
     words = split_text_to_words(text)
     total = len(words)
     if total == 0:
@@ -702,14 +677,7 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
         uname_for_stat = fetch_display_username(user_id) or str(user_id)
 
         while not stop_event.is_set():
-            # Initial checks for maintenance/suspension are outside the tight loop
-            if is_maintenance_time():
-                # Block until maintenance ends or worker is stopped
-                cancel_active_task_for_user(user_id)
-                while is_maintenance_time() and not stop_event.is_set():
-                    wake_event.wait(timeout=3.0)
-                    wake_event.clear()
-                continue
+            # Initial checks for suspension are outside the tight loop
             
             if is_suspended(user_id):
                 # Block until unsuspended or worker is stopped
@@ -777,9 +745,9 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 
                 status = row[0]
                 
-                # Check for external interrupts first (Suspension/Maintenance)
-                if status == "cancelled" or is_suspended(user_id) or is_maintenance_time():
-                    # If cancelled/suspended/maintenance, break and handle cleanup outside
+                # Check for external interrupts first (Suspension)
+                if status == "cancelled" or is_suspended(user_id):
+                    # If cancelled/suspended, break and handle cleanup outside
                     break
 
                 if status == "paused":
@@ -803,8 +771,8 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                             c_check.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
                             row2 = c_check.fetchone()
                         
-                        if not row2 or row2[0] == "cancelled" or is_suspended(user_id) or is_maintenance_time():
-                            break # Cancelled externally/suspended/maintenance
+                        if not row2 or row2[0] == "cancelled" or is_suspended(user_id):
+                            break # Cancelled externally/suspended
                         
                         if row2[0] == "running":
                             try:
@@ -815,15 +783,11 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                             break # Exit pause loop
                     
                     # If any of the main loop breaking conditions were met inside the pause loop
-                    if status == "cancelled" or is_suspended(user_id) or is_maintenance_time() or stop_event.is_set():
+                    if status == "cancelled" or is_suspended(user_id) or stop_event.is_set():
                         # Set final status and break main loop
                         if is_suspended(user_id):
                             set_task_status(task_id, "cancelled")
                             try: send_message(user_id, "⛔ You have been suspended; stopping your task.")
-                            except Exception: pass
-                        elif is_maintenance_time():
-                            set_task_status(task_id, "cancelled")
-                            try: send_message(user_id, f"🛠️ Your task stopped due to scheduled maintenance.")
                             except Exception: pass
                         break
                     
@@ -872,8 +836,8 @@ def per_user_worker_loop(user_id: int, wake_event: threading.Event, stop_event: 
                 # Update last_send_time for the next iteration
                 last_send_time = time.monotonic()
 
-                # Re-check for external interrupts (maintenance/suspension) after the sleep
-                if is_maintenance_time() or is_suspended(user_id):
+                # Re-check for external interrupts (suspension) after the sleep
+                if is_suspended(user_id):
                     break
 
             # --- Task Finalization ---
@@ -984,12 +948,9 @@ def check_and_lift():
         except Exception:
             logger.exception("suspend parse error for %s", r)
 
-# Nigeria time: 2 AM = UTC 1; 3 AM = UTC 2
 scheduler = BackgroundScheduler()
 scheduler.add_job(send_hourly_owner_stats, "interval", hours=1, next_run_time=datetime.utcnow() + timedelta(seconds=10), timezone='UTC')
 scheduler.add_job(check_and_lift, "interval", minutes=1, next_run_time=datetime.utcnow() + timedelta(seconds=15), timezone='UTC')
-scheduler.add_job(start_maintenance, 'cron', hour=1, minute=0, timezone='UTC')
-scheduler.add_job(end_maintenance, 'cron', hour=2, minute=0, timezone='UTC')
 scheduler.start()
 
 @app.route("/webhook", methods=["POST"])
@@ -1071,14 +1032,10 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             "ℹ️ About:\n"
             "I split texts into single words. ✂️\n\n"
             "Features:\n"
-            "queueing, pause/resume, scheduled maintenance (2AM–3AM),\n"
+            "queueing, pause/resume,\n"
             "hourly owner stats, rate-limited sending. ⚖️"
         )
         send_message(user_id, msg)
-        return jsonify({"ok": True})
-
-    if command != "/start" and is_maintenance_time() and not is_owner(user_id):
-        send_message(user_id, "🛠️ Scheduled maintenance in progress. Tasks are temporarily blocked. Please try later.")
         return jsonify({"ok": True})
 
     if user_id not in OWNER_IDS and not is_allowed(user_id):
@@ -1095,9 +1052,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
         ])
         res = enqueue_task(user_id, username, sample)
         if not res["ok"]:
-            if res.get("reason") == "maintenance":
-                send_message(user_id, "🛠️ Scheduled maintenance in progress. Try later.")
-                return jsonify({"ok": True})
             send_message(user_id, "❗ Could not queue demo. Try later.")
             return jsonify({"ok": True})
         start_user_worker_if_needed(user_id)
@@ -1287,10 +1241,8 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             total_allowed = c.fetchone()[0]
             c.execute("SELECT COUNT(*) FROM suspended_users")
             total_suspended = c.fetchone()[0]
-        maintenance_status = "ON" if is_maintenance_time() else "OFF"
         body = (
             f"🤖 Bot status: Online\n"
-            f"🛠️ Maintenance: {maintenance_status}\n"
             f"👥 Allowed users: {total_allowed}\n"
             f"🚫 Suspended users: {total_suspended}\n"
             f"⚙️ Active tasks: {len(active_rows)}\n"
@@ -1327,7 +1279,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
             notify_owners("⚠️ Broadcast failures: " + ", ".join(f"{x[0]}({x[1]})" for x in failed))
         return jsonify({"ok": True})
 
-    # Replace the existing suspend parsing block in handle_command(...):
     if command == "/suspend":
         if not is_owner(user_id):
             send_message(user_id, f"🔒 {OWNER_TAG} only.")
@@ -1383,9 +1334,6 @@ def handle_command(user_id: int, username: str, command: str, args: str):
     return jsonify({"ok": True})
 
 def handle_user_text(user_id: int, username: str, text: str):
-    if is_maintenance_time():
-        send_message(user_id, "🛠️ Scheduled maintenance in progress. Tasks are temporarily blocked. Please try later.")
-        return jsonify({"ok": True})
     # Owners are always allowed; regular users must be in allowed_users
     if user_id not in OWNER_IDS and not is_allowed(user_id):
         # Only place where user's numeric ID is shown to the user per request
@@ -1403,9 +1351,6 @@ def handle_user_text(user_id: int, username: str, text: str):
         return jsonify({"ok": True})
     res = enqueue_task(user_id, username, text)
     if not res["ok"]:
-        if res.get("reason") == "maintenance":
-            send_message(user_id, "🛠️ Scheduled maintenance in progress. Try later.")
-            return jsonify({"ok": True})
         if res["reason"] == "empty":
             send_message(user_id, "⚠️ Empty text. Nothing to split.")
             return jsonify({"ok": True})
